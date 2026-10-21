@@ -118,14 +118,13 @@ function letterAt(name) {
 /** Draws the board from the current snapshot. */
 function draw() {
   boardElement.textContent = '';
-  const fileStart = flipped ? 0 : 7;
-  const fileStep = flipped ? 1 : -1;
 
   for (let row = 0; row < 8; row += 1) {
-    // Row 0 is the top of the board, which is rank 8 unless the board is flipped.
+    // Row 0 is the top of the board, which is rank 8 unless the board is flipped;
+    // the files always run a-to-h left to right unless it is.
     const rank = flipped ? row : 7 - row;
     for (let column = 0; column < 8; column += 1) {
-      const file = fileStart + column * fileStep;
+      const file = flipped ? 7 - column : column;
       const name = squareName(file, rank);
       const letter = letterAt(name);
 
@@ -308,26 +307,31 @@ async function engineTurn() {
   if (thinking || state.outcome !== 'playing') {
     return;
   }
-  thinking = true;
   const side = state.side;
+  thinking = true;
+  let chosen = null;
   setMessage(`${colourWord(side)} is thinking…`);
   try {
     const reply = await send('search', { level: Number(levelSelect.value) });
     const search = reply.search;
-    showProgress(search);
-    if (!search.uci) {
-      return;
+    if (search?.uci) {
+      showProgress(search);
+      setMessage(
+        `${colourWord(side)} played ${search.san} — depth ${search.depth}, ` +
+          `${formatScore(search.mateIn, search.score, side)}, ${formatCount(search.nodes)} nodes ` +
+          `in ${Math.round(search.timeMs)} ms.`,
+      );
+      chosen = search;
     }
-    setMessage(
-      `${colourWord(side)} played ${search.san} — depth ${search.depth}, ` +
-        `${formatScore(search.mateIn, search.score, side)}, ${formatCount(search.nodes)} nodes ` +
-        `in ${Math.round(search.timeMs)} ms.`,
-    );
-    await applyState(await send('play', { uci: search.uci }));
   } catch (error) {
     setMessage(`The engine could not move: ${error.message}`, true);
   } finally {
+    // Released before the move is applied: applying it is what decides whether the
+    // engine moves again, and in a two-engine game that call comes straight back.
     thinking = false;
+  }
+  if (chosen) {
+    await applyState(await send('play', { uci: chosen.uci }));
   }
 }
 
