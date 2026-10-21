@@ -1,0 +1,15 @@
+# Rust build output.  The compiled wasm is committed where it is served from
+# (the arcade's public/wasm/ and web/pkg/), not here.
+/target
+
+# wasm-pack's generated package folder at the repository root.  web/pkg/ holds a
+# copy of the same artefacts, and that copy is committed on purpose so the harness
+# runs from a fresh clone without a Rust toolchain — hence the leading slash, which
+# pins the pattern to the root.
+/pkg/
+
+# Editors and OS noise.
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

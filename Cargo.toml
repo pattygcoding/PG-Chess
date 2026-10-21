@@ -1,0 +1,40 @@
+[package]
+name = "pg_chess"
+version = "0.1.0"
+edition = "2021"
+description = "A bitboard chess engine written in Rust and compiled to WebAssembly"
+license = "MIT"
+repository = "https://github.com/pattygcoding/PG-Chess"
+readme = "README.md"
+keywords = ["chess", "wasm", "bitboard", "engine"]
+categories = ["games"]
+
+[lib]
+# `cdylib` is what wasm-pack links into a .wasm module; `rlib` keeps the crate
+# usable as a normal Rust library, which is what `cargo test` and the bench
+# binary in src/bin/ link against.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Pinned to the version this workspace already has cached, so the wasm-bindgen
+# CLI that wasm-pack downloads always matches the glue it generates.
+wasm-bindgen = "=0.2.129"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Only the browser build needs a clock that reads performance.now(); the native
+# build uses std::time::Instant instead (see `search::now_ms`).
+js-sys = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+# Perft is the move generator's test rig: a debug build of it is unusably slow,
+# so `cargo test --release` (and the bench binary) get the same optimisations as
+# the shipped wasm module.
+[profile.bench]
+opt-level = 3
+lto = true
+codegen-units = 1

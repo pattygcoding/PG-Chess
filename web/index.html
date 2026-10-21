@@ -1,0 +1,440 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PG-Chess — Rust bitboard engine in WebAssembly</title>
+    <meta
+      name="description"
+      content="A bitboard chess engine written in Rust and compiled to WebAssembly: alpha-beta search, a transposition table, quiescence, and a perft-verified move generator."
+    />
+    <!--
+      The harness is three files: this page, main.js (the UI and the game loop) and
+      worker.js (which owns the engine).  The styles are inline so the page needs
+      nothing but the repository, and the engine glue is the pkg/ folder wasm-pack
+      generates.
+    -->
+    <style>
+      :root {
+        color-scheme: dark;
+        --ink-950: #05070c;
+        --ink-850: #0d1219;
+        --ink-700: #1a2230;
+        --line: rgba(255, 255, 255, 0.07);
+        --fg: #e8ecea;
+        --fg-strong: #f2f5f3;
+        --fg-muted: #8a93a0;
+        --fg-dim: #6b7482;
+        --accent: #8debc4;
+        --on-accent: #05070c;
+        --light-square: #b8c2cc;
+        --dark-square: #4a5568;
+        --select: rgba(141, 235, 196, 0.45);
+        --last: rgba(141, 235, 196, 0.22);
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        min-height: 100dvh;
+        padding: 28px 18px 56px;
+        font-family: 'Inter', ui-sans-serif, system-ui, sans-serif;
+        color: var(--fg);
+        background-color: var(--ink-950);
+        background-image: radial-gradient(1100px 520px at 78% -8%, rgba(141, 235, 196, 0.07), transparent 65%),
+          radial-gradient(900px 480px at 8% 108%, rgba(105, 140, 200, 0.06), transparent 70%);
+        background-attachment: fixed;
+      }
+      .page {
+        max-width: 1080px;
+        margin: 0 auto;
+      }
+      .micro {
+        font-family: 'JetBrains Mono', ui-monospace, monospace;
+        text-transform: uppercase;
+        letter-spacing: 0.18em;
+        font-size: 10px;
+        line-height: 1.4;
+        color: var(--fg-dim);
+      }
+      header h1 {
+        margin: 10px 0 6px;
+        font-size: clamp(28px, 5vw, 40px);
+        letter-spacing: -0.02em;
+      }
+      header h1 span {
+        color: var(--accent);
+      }
+      header p {
+        margin: 0 0 22px;
+        max-width: 64ch;
+        color: var(--fg-muted);
+        line-height: 1.6;
+      }
+      .layout {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(18rem, 22rem);
+        gap: 18px;
+        align-items: start;
+      }
+      @media (max-width: 900px) {
+        .layout {
+          grid-template-columns: minmax(0, 1fr);
+        }
+      }
+      .panel {
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: rgba(10, 14, 21, 0.7);
+        padding: 16px;
+      }
+      .board-wrap {
+        position: relative;
+      }
+      .board {
+        display: grid;
+        grid-template-columns: repeat(8, 1fr);
+        aspect-ratio: 1;
+        width: 100%;
+        border-radius: 10px;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        user-select: none;
+        touch-action: manipulation;
+      }
+      .square {
+        position: relative;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: clamp(22px, 5.2vw, 44px);
+        line-height: 1;
+      }
+      .square.light {
+        background: var(--light-square);
+      }
+      .square.dark {
+        background: var(--dark-square);
+      }
+      .square.playable {
+        cursor: pointer;
+      }
+      .square.last::after,
+      .square.selected::after {
+        content: '';
+        position: absolute;
+        inset: 0;
+      }
+      .square.last::after {
+        background: var(--last);
+      }
+      .square.selected::after {
+        background: var(--select);
+      }
+      .square .piece {
+        position: relative;
+        z-index: 1;
+        filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.5));
+      }
+      .square .piece.white {
+        color: #fbfdfc;
+      }
+      .square .piece.black {
+        color: #14181f;
+      }
+      .square .target {
+        position: absolute;
+        width: 26%;
+        height: 26%;
+        border-radius: 50%;
+        background: rgba(5, 7, 12, 0.35);
+      }
+      .square .target.capture {
+        width: 92%;
+        height: 92%;
+        border-radius: 12%;
+        background: transparent;
+        border: 3px solid rgba(190, 60, 60, 0.75);
+      }
+      .square .coord {
+        position: absolute;
+        left: 3px;
+        bottom: 1px;
+        font: 600 9px 'JetBrains Mono', monospace;
+        color: rgba(5, 7, 12, 0.55);
+      }
+      .square .coord.file {
+        left: auto;
+        right: 3px;
+      }
+      .promotion {
+        position: absolute;
+        inset: 0;
+        z-index: 5;
+        display: grid;
+        place-items: center;
+        background: rgba(5, 7, 12, 0.72);
+        border-radius: 10px;
+      }
+      /* `display: grid` above would otherwise beat the `hidden` attribute, leaving
+         an invisible overlay swallowing every click on the board. */
+      .promotion[hidden] {
+        display: none;
+      }
+      .promotion .picker {
+        display: flex;
+        gap: 8px;
+        padding: 12px;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: var(--ink-850);
+      }
+      .promotion button {
+        width: 54px;
+        height: 54px;
+        font-size: 30px;
+        line-height: 1;
+        color: var(--fg-strong);
+      }
+      button {
+        font: 600 13px 'Inter', sans-serif;
+        color: var(--fg);
+        background: var(--ink-850);
+        border: 1px solid var(--line);
+        border-radius: 9px;
+        padding: 9px 13px;
+        cursor: pointer;
+        transition: border-color 0.15s, color 0.15s, transform 0.15s;
+      }
+      button:hover:not(:disabled) {
+        border-color: rgba(141, 235, 196, 0.4);
+        color: var(--accent);
+      }
+      button:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+      }
+      button.primary {
+        background: var(--accent);
+        color: var(--on-accent);
+        border-color: var(--accent);
+      }
+      button.primary:hover {
+        transform: translateY(-1px);
+        color: var(--on-accent);
+      }
+      select {
+        font: 600 13px 'Inter', sans-serif;
+        color: var(--fg);
+        background: var(--ink-850);
+        border: 1px solid var(--line);
+        border-radius: 9px;
+        padding: 9px 10px;
+      }
+      .row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        align-items: center;
+      }
+      .status {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px 18px;
+        margin: 14px 0 0;
+        padding-top: 14px;
+        border-top: 1px solid var(--line);
+      }
+      .status div {
+        min-width: 84px;
+      }
+      .status dt {
+        margin-bottom: 3px;
+      }
+      .status dd {
+        margin: 0;
+        font: 600 15px 'JetBrains Mono', monospace;
+        color: var(--fg-strong);
+      }
+      .message {
+        margin-top: 12px;
+        min-height: 20px;
+        font-size: 14px;
+        color: var(--accent);
+      }
+      .message.warn {
+        color: #f0b429;
+      }
+      .eval-bar {
+        height: 8px;
+        margin-top: 14px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        background: #14181f;
+        overflow: hidden;
+      }
+      .eval-bar span {
+        display: block;
+        height: 100%;
+        background: linear-gradient(90deg, #dfe6ec, var(--accent));
+        transition: width 0.25s ease;
+      }
+      .moves {
+        margin: 0;
+        padding: 0;
+        list-style: none;
+        max-height: 15rem;
+        overflow-y: auto;
+        font: 500 13px 'JetBrains Mono', monospace;
+      }
+      .moves li {
+        display: grid;
+        grid-template-columns: 2.4rem 1fr 1fr;
+        gap: 8px;
+        padding: 3px 4px;
+        border-radius: 5px;
+      }
+      .moves li:nth-child(odd) {
+        background: rgba(255, 255, 255, 0.03);
+      }
+      .moves .number {
+        color: var(--fg-dim);
+      }
+      .panel h2 {
+        margin: 0 0 10px;
+        font-size: 15px;
+      }
+      .panel + .panel {
+        margin-top: 14px;
+      }
+      .perft table {
+        width: 100%;
+        border-collapse: collapse;
+        font: 500 12px 'JetBrains Mono', monospace;
+      }
+      .perft th,
+      .perft td {
+        text-align: left;
+        padding: 4px 6px;
+        border-bottom: 1px solid var(--line);
+        color: var(--fg-muted);
+      }
+      .perft td.ok {
+        color: var(--accent);
+      }
+      .perft td.bad {
+        color: #ef6f6f;
+      }
+      .hint {
+        margin: 10px 0 0;
+        color: var(--fg-dim);
+        font-size: 12px;
+        line-height: 1.6;
+      }
+      a {
+        color: var(--accent);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <header>
+        <p class="micro">Rust · WebAssembly · Bitboards</p>
+        <h1>PG<span>-Chess</span></h1>
+        <p>
+          A chess engine written in Rust and compiled to WebAssembly: 64-bit bitboards, iterative
+          deepening negamax with alpha-beta pruning and fail-soft bounds, a 32 MB transposition
+          table, MVV-LVA ordering backed by killers and history, and a quiescence search at the
+          leaves. The move generator is checked against the published perft counts, and the whole
+          thing runs in a Web Worker so the board never freezes.
+        </p>
+      </header>
+
+      <div class="layout">
+        <div>
+          <div class="panel board-wrap">
+            <div class="board" id="board" role="grid" aria-label="Chess board"></div>
+            <div class="promotion" id="promotion" hidden></div>
+            <div class="eval-bar" aria-label="Evaluation" id="eval-wrap">
+              <span id="eval-bar" style="width: 50%"></span>
+            </div>
+            <div class="message" id="message" role="status">Loading the engine…</div>
+          </div>
+
+          <div class="panel">
+            <div class="row">
+              <button type="button" class="primary" id="new-game">New game</button>
+              <button type="button" id="undo">Take back</button>
+              <button type="button" id="flip">Flip board</button>
+              <span class="micro">Level</span>
+              <select id="level" aria-label="Engine level">
+                <option value="0">Casual</option>
+                <option value="1" selected>Club</option>
+                <option value="2">Strong</option>
+              </select>
+              <span class="micro">You play</span>
+              <select id="side" aria-label="Which side you play">
+                <option value="white" selected>White</option>
+                <option value="black">Black</option>
+                <option value="none">Both (engine against itself)</option>
+              </select>
+            </div>
+            <dl class="status">
+              <div><dt class="micro">Turn</dt><dd id="turn">White</dd></div>
+              <div><dt class="micro">Depth</dt><dd id="depth">—</dd></div>
+              <div><dt class="micro">Score</dt><dd id="score">—</dd></div>
+              <div><dt class="micro">Nodes</dt><dd id="nodes">—</dd></div>
+              <div><dt class="micro">Speed</dt><dd id="nps">—</dd></div>
+            </dl>
+            <p class="hint" id="pv"></p>
+          </div>
+        </div>
+
+        <div>
+          <div class="panel">
+            <h2>Moves</h2>
+            <ol class="moves" id="moves"></ol>
+          </div>
+
+          <div class="panel perft">
+            <h2>Move generator check</h2>
+            <p class="hint" style="margin-top: 0">
+              Perft counts the leaves of the move tree. These are the published counts for the
+              starting position, measured in this browser tab.
+            </p>
+            <table>
+              <thead>
+                <tr>
+                  <th>Depth</th>
+                  <th>Expected</th>
+                  <th>Counted</th>
+                  <th>Time</th>
+                </tr>
+              </thead>
+              <tbody id="perft-rows"></tbody>
+            </table>
+            <div class="row" style="margin-top: 10px">
+              <button type="button" id="run-perft">Run perft 1–5</button>
+            </div>
+          </div>
+
+          <div class="panel">
+            <h2>Engine</h2>
+            <dl class="status" style="margin-top: 0; border-top: 0; padding-top: 0">
+              <div><dt class="micro">Table</dt><dd id="tt-size">—</dd></div>
+              <div><dt class="micro">Search</dt><dd>Worker</dd></div>
+            </dl>
+            <p class="hint">
+              Every search runs in <code>worker.js</code>, so the page stays responsive. Take back
+              removes the engine's reply as well as yours.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="./main.js"></script>
+
+  </body>
+</html>
