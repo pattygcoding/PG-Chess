@@ -20,6 +20,7 @@ pub mod movegen;
 pub mod moves;
 pub mod perft;
 pub mod search;
+pub mod see;
 pub mod tt;
 
 use board::{Board, Outcome, WHITE};

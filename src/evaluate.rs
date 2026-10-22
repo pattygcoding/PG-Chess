@@ -16,8 +16,11 @@
 //! isolated and passed pawns, rooks on open files and a light king shield —
 //! because piece-square tables alone cannot see pawn structure.
 
-use crate::bitboard::{pop_lsb, popcount, square_bb, Bitboard};
-use crate::board::{Board, BISHOP, BLACK, PAWN, ROOK, WHITE};
+use crate::bitboard::{
+    bishop_attacks, king_attacks, knight_attacks, pop_lsb, popcount, queen_attacks, rook_attacks,
+    square_bb, Bitboard,
+};
+use crate::board::{Board, BISHOP, BLACK, KNIGHT, PAWN, QUEEN, ROOK, WHITE};
 
 /// The material value of each piece, middlegame and endgame, in centipawns.
 pub const MG_VALUES: [i32; 6] = [82, 337, 365, 477, 1025, 0];
@@ -63,6 +66,19 @@ const ISOLATED_PAWN: (i32, i32) = (-12, -16);
 const ROOK_OPEN_FILE: (i32, i32) = (20, 10);
 const ROOK_SEMI_OPEN_FILE: (i32, i32) = (10, 5);
 const KING_SHIELD_PAWN: i32 = 8;
+
+/// What one square of mobility is worth, by piece type (mg, eg).  A queen is worth
+/// little per square because it has so many of them, a bishop more than a rook for
+/// the same reason in the endgame, where the board opens up.
+pub const MOBILITY: [(i32, i32); 6] = [(0, 0), (4, 4), (3, 5), (2, 4), (1, 2), (0, 0)];
+
+/// How much of the king's safety one attacking piece is worth, by type.  The
+/// squares a piece attacks matter less than which piece it is.
+pub const KING_ATTACK_WEIGHT: [i32; 6] = [0, 2, 3, 4, 6, 0];
+
+/// How much a passed pawn's promotion square is worth per step of king proximity,
+/// for the escorting king (a bonus) and the defending king (a penalty).
+const PASSED_PAWN_KING_STEP: i32 = 5;
 
 const MG_PAWN_TABLE: [i32; 64] = [
     0, 0, 0, 0, 0, 0, 0, 0, //
@@ -214,9 +230,87 @@ const EG_TABLES: [&[i32; 64]; 6] = [
     &EG_KING_TABLE,
 ];
 
+/// Which of the position-aware terms beyond material and the piece-square tables
+/// are switched on.
+///
+/// PeSTO's tables alone cannot see that a knight in the corner is idle or that the
+/// king in front of it is under attack, so these three terms are the difference
+/// between "counting material well" and "understanding the position".  They are
+/// flags because they cost time at every leaf, and because the match binary plays
+/// the engine against itself with them on and off — which is the only honest way to
+/// claim any of them earned its keep.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct EvalFeatures {
+    /// How many squares each piece can move to, counted from its attack sets.
+    pub mobility: bool,
+    /// How many enemy pieces are bearing down on the king's neighbourhood.
+    pub king_safety: bool,
+    /// How close each side's king is to the passed pawn it is escorting or chasing.
+    pub passed_pawn_king_proximity: bool,
+    /// Read the position from white's side rather than from the side to move.
+    ///
+    /// This is how the engine's first release scored positions, and it was wrong:
+    /// `negamax` negates a child's score, so an evaluation has to be written from the
+    /// mover's point of view, and a score that was always white's made the search
+    /// prefer its own worst move wherever the two disagreed.  The flag exists so the
+    /// match binary can play the fixed engine against the one that shipped and put a
+    /// number on the fix; nothing that ships turns it on, and
+    /// `the_orientation_of_the_score_is_the_side_to_moves` is what holds the
+    /// convention down.
+    pub white_positive_score: bool,
+}
+
+impl EvalFeatures {
+    /// The configuration that ships.  `mobility` is *not* among the terms, which is a
+    /// measured decision rather than an omission: counted this way it scored 20 Elo
+    /// (then 44) *worse* at equal depth and was level at equal time, so it is a cost
+    /// without a return.  The next thing to try on it is the usual refinement —
+    /// counting only squares the enemy's pawns do not cover — rather than more weight.
+    pub const fn all() -> Self {
+        EvalFeatures {
+            mobility: false,
+            king_safety: true,
+            passed_pawn_king_proximity: true,
+            white_positive_score: false,
+        }
+    }
+
+    pub const fn none() -> Self {
+        EvalFeatures {
+            mobility: false,
+            king_safety: false,
+            passed_pawn_king_proximity: false,
+            white_positive_score: false,
+        }
+    }
+
+    /// The terms as the first release had them: no mobility, no king safety, no king
+    /// proximity to a passed pawn, and the score read from white's side.
+    pub const fn as_shipped() -> Self {
+        EvalFeatures {
+            mobility: false,
+            king_safety: false,
+            passed_pawn_king_proximity: false,
+            white_positive_score: true,
+        }
+    }
+}
+
+impl Default for EvalFeatures {
+    fn default() -> Self {
+        EvalFeatures::all()
+    }
+}
+
 /// The static score of the position, in centipawns, from the side to move's point
 /// of view: positive means the side to move stands better.
 pub fn evaluate(board: &Board) -> i32 {
+    evaluate_with(board, EvalFeatures::all())
+}
+
+/// The static score with individual terms switched off, which is what the
+/// self-play matches use to measure what each one is worth.
+pub fn evaluate_with(board: &Board, features: EvalFeatures) -> i32 {
     let mut mg = [0i32; 2];
     let mut eg = [0i32; 2];
     let mut phase = 0;
@@ -236,24 +330,111 @@ pub fn evaluate(board: &Board) -> i32 {
             }
         }
 
-        let (structure_mg, structure_eg) = structure_terms(board, colour);
+        let (structure_mg, structure_eg) = structure_terms(board, colour, features);
         mg[colour] += structure_mg;
         eg[colour] += structure_eg;
+
+        if features.mobility {
+            let (mobility_mg, mobility_eg) = mobility_terms(board, colour);
+            mg[colour] += mobility_mg;
+            eg[colour] += mobility_eg;
+        }
+        if features.king_safety {
+            mg[colour] -= king_danger(board, colour);
+        }
     }
 
-    let midgame = mg[WHITE] - mg[BLACK];
-    let endgame = eg[WHITE] - eg[BLACK];
+    let side = board.side;
+    let other = 1 - side;
+    // The score has to be the *mover's*: `negamax` negates whatever a child returns,
+    // so a score read from white's side is upside down for every black-to-move node,
+    // and the search would then prefer its own worst move.  `white_positive_score` is
+    // the first release's mistake, kept only so a match can measure how much the fix
+    // is worth.
+    let (midgame, endgame) = if features.white_positive_score {
+        (mg[WHITE] - mg[BLACK], eg[WHITE] - eg[BLACK])
+    } else {
+        (mg[side] - mg[other], eg[side] - eg[other])
+    };
     let phase = phase.clamp(0, MAX_PHASE);
 
     // PeSTO's taper: the middlegame reading holds while the board is full and
     // gives way linearly as material leaves it.
     let score = (midgame * phase + endgame * (MAX_PHASE - phase)) / MAX_PHASE;
-    let tempo = if board.side == WHITE { TEMPO } else { -TEMPO };
+    // Having the move is worth something, and it is worth it to the side that has it.
+    // The first release instead signed the bonus with white, which is the same
+    // mistake as the positional part and is kept alive only by the flag.
+    let tempo = if features.white_positive_score && board.side != WHITE {
+        -TEMPO
+    } else {
+        TEMPO
+    };
     score + tempo
 }
 
+/// How many squares each of a side's pieces attacks, weighted by piece type.
+///
+/// A knight with eight moves is doing more than a knight with two, and counting the
+/// attack sets — rather than only the empty squares they reach — is what makes this
+/// cheap: the sets are one lookup for the leapers and one ray walk per slider.
+fn mobility_terms(board: &Board, colour: usize) -> (i32, i32) {
+    let own = board.colour_of(colour);
+    let occupied = board.occupied();
+    let mut mg = 0;
+    let mut eg = 0;
+
+    for kind in [KNIGHT, BISHOP, ROOK, QUEEN] {
+        let mut pieces = board.pieces_of(colour, kind);
+        while pieces != 0 {
+            let square = pop_lsb(&mut pieces);
+            let attacks = piece_attacks(square, kind, occupied);
+            let squares = popcount(attacks & !own) as i32;
+            mg += squares * MOBILITY[kind].0;
+            eg += squares * MOBILITY[kind].1;
+        }
+    }
+    (mg, eg)
+}
+
+/// How dangerous the enemy pieces are to this side's king, as a middlegame penalty.
+///
+/// Each enemy knight, bishop, rook or queen that attacks one of the eight squares
+/// around the king contributes units by type; the total is squared, because two
+/// attackers are more than twice as dangerous as one.  This is the classic shape of
+/// the term, and it is what stops the engine from leaving its king in a position
+/// where a sacrifice opens it up.
+fn king_danger(board: &Board, colour: usize) -> i32 {
+    let king = board.king_square(colour);
+    let ring = king_attacks(king) | square_bb(king);
+    let occupied = board.occupied();
+    let mut units = 0;
+
+    for kind in [KNIGHT, BISHOP, ROOK, QUEEN] {
+        let mut pieces = board.pieces_of(1 - colour, kind);
+        while pieces != 0 {
+            let square = pop_lsb(&mut pieces);
+            if piece_attacks(square, kind, occupied) & ring != 0 {
+                units += KING_ATTACK_WEIGHT[kind];
+            }
+        }
+    }
+    units * units / 4
+}
+
+/// The attack set of one piece, which is a table lookup for the leapers and a ray
+/// walk for the sliders.
+fn piece_attacks(square: usize, kind: usize, occupied: Bitboard) -> Bitboard {
+    match kind {
+        KNIGHT => knight_attacks(square),
+        BISHOP => bishop_attacks(square, occupied),
+        ROOK => rook_attacks(square, occupied),
+        QUEEN => queen_attacks(square, occupied),
+        _ => 0,
+    }
+}
+
 /// The terms that care about where the pieces are rather than which they are.
-fn structure_terms(board: &Board, colour: usize) -> (i32, i32) {
+fn structure_terms(board: &Board, colour: usize, features: EvalFeatures) -> (i32, i32) {
     let mut mg = 0;
     let mut eg = 0;
 
@@ -292,9 +473,14 @@ fn structure_terms(board: &Board, colour: usize) -> (i32, i32) {
     let mut pawns = board.pieces_of(colour, PAWN);
     while pawns != 0 {
         let square = pop_lsb(&mut pawns);
-        let (passed_mg, passed_eg) = passed_pawn_bonus(board, colour, square);
-        mg += passed_mg;
-        eg += passed_eg;
+        let (passed_mg, mut passed_eg) = passed_pawn_bonus(board, colour, square);
+        if passed_mg != 0 || passed_eg != 0 {
+            if features.passed_pawn_king_proximity {
+                passed_eg += passed_pawn_king_proximity(board, colour, square);
+            }
+            mg += passed_mg;
+            eg += passed_eg;
+        }
     }
 
     let open_files = open_file_flags(board);
@@ -352,6 +538,30 @@ fn passed_pawn_bonus(board: &Board, colour: usize, square: usize) -> (i32, i32) 
     // Distance from promotion, so both colours read the same ladder.
     let relative = if colour == WHITE { rank } else { 7 - rank };
     PASSED_PAWN_BONUS[relative]
+}
+
+/// A passed pawn is worth more when its own king is near the square it is heading
+/// for and the enemy king is not: in the endgame that is most of what a passed pawn
+/// is for.
+///
+/// The distance is Chebyshev (king moves), so it counts real steps towards the pawn.
+fn passed_pawn_king_proximity(board: &Board, colour: usize, pawn: usize) -> i32 {
+    let file = crate::bitboard::file_of(pawn);
+    let promotion_rank = if colour == WHITE { 7 } else { 0 };
+    let target = crate::bitboard::square_index(file, promotion_rank);
+
+    let ours = king_distance(board.king_square(colour), target);
+    let theirs = king_distance(board.king_square(1 - colour), target);
+    (theirs - ours) * PASSED_PAWN_KING_STEP
+}
+
+/// King moves between two squares.
+fn king_distance(from: usize, to: usize) -> i32 {
+    let (from_file, from_rank) = (crate::bitboard::file_of(from), crate::bitboard::rank_of(from));
+    let (to_file, to_rank) = (crate::bitboard::file_of(to), crate::bitboard::rank_of(to));
+    (from_file as i32 - to_file as i32)
+        .abs()
+        .max((from_rank as i32 - to_rank as i32).abs())
 }
 
 /// Per file: bit 0 means no pawns at all, bit 1 means no white pawns, bit 2 means
@@ -449,15 +659,201 @@ mod tests {
     }
 
     #[test]
+    fn mobility_counts_the_squares_a_piece_can_move_to() {
+        // A knight on d4 has eight moves; the same knight in the corner has two.
+        let central = Board::from_fen("4k3/8/8/8/3N4/8/8/4K3 w - - 0 1").unwrap();
+        let corner = Board::from_fen("4k3/8/8/8/8/8/8/N3K3 w - - 0 1").unwrap();
+        assert_eq!(
+            mobility_terms(&central, WHITE).0,
+            8 * MOBILITY[KNIGHT].0,
+            "central knight"
+        );
+        assert_eq!(
+            mobility_terms(&corner, WHITE).0,
+            2 * MOBILITY[KNIGHT].0,
+            "corner knight"
+        );
+        // And the whole score moves with it, in the same direction, whenever the term
+        // is switched on (it is off in the shipped set: see `EvalFeatures::all`).
+        let with_mobility = EvalFeatures {
+            mobility: true,
+            ..EvalFeatures::all()
+        };
+        let central_gain =
+            evaluate_with(&central, with_mobility) - evaluate_with(&central, EvalFeatures::all());
+        let corner_gain =
+            evaluate_with(&corner, with_mobility) - evaluate_with(&corner, EvalFeatures::all());
+        assert!(
+            central_gain > corner_gain && corner_gain > 0,
+            "central {} vs corner {}",
+            central_gain,
+            corner_gain
+        );
+    }
+
+    #[test]
+    fn king_safety_is_zero_until_something_attacks_the_king() {
+        let quiet = Board::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        assert_eq!(king_danger(&quiet, WHITE), 0);
+        assert_eq!(king_danger(&quiet, BLACK), 0);
+
+        // A queen on e2 stands on the white king's ring and hits five squares of it.
+        let watched = Board::from_fen("4k3/8/8/8/8/8/4q3/4K3 w - - 0 1").unwrap();
+        let units = KING_ATTACK_WEIGHT[QUEEN];
+        assert_eq!(king_danger(&watched, WHITE), units * units / 4);
+        // The white king on e1 is nowhere near the black king on e8.
+        assert_eq!(king_danger(&watched, BLACK), 0);
+
+        // Two attackers are more than twice as bad as one: the term is quadratic.
+        let doubled = Board::from_fen("4k3/8/8/8/8/8/3qq3/4K3 w - - 0 1").unwrap();
+        assert!(
+            king_danger(&doubled, WHITE) > 2 * king_danger(&watched, WHITE),
+            "one attacker {} vs two {}",
+            king_danger(&watched, WHITE),
+            king_danger(&doubled, WHITE)
+        );
+    }
+
+    #[test]
+    fn a_passed_pawn_is_worth_more_with_its_own_king_in_front_of_it() {
+        // Both kings are the same distance away in one position and not in the
+        // other; the promotion square is d8 and the pawn is on d5.
+        let pawn_square = crate::bitboard::parse_square("d5").unwrap();
+        let escort = Board::from_fen("8/8/8/3P4/3K4/8/8/4k3 w - - 0 1").unwrap();
+        let distant = Board::from_fen("8/8/8/3P4/8/8/8/3Kk3 w - - 0 1").unwrap();
+        assert!(
+            passed_pawn_king_proximity(&escort, WHITE, pawn_square) > 0,
+            "escorting king is four steps from d8, the defending king seven"
+        );
+        assert_eq!(
+            passed_pawn_king_proximity(&distant, WHITE, pawn_square),
+            0,
+            "both kings are seven steps away"
+        );
+        // The term is a bonus for whoever owns the pawn, so the mirrored position
+        // hands black exactly the same number.  That is the property that keeps the
+        // whole evaluation antisymmetric when the colours swap.
+        let mirrored_escort = Board::from_fen(&mirrored("8/8/8/3P4/3K4/8/8/4k3 w - - 0 1")).unwrap();
+        let mirrored_pawn = crate::bitboard::parse_square("d4").unwrap();
+        assert_eq!(
+            passed_pawn_king_proximity(&escort, WHITE, pawn_square),
+            passed_pawn_king_proximity(&mirrored_escort, BLACK, mirrored_pawn)
+        );
+    }
+
+    #[test]
+    fn every_term_can_be_switched_off_and_back_on() {
+        let board = Board::from_fen("r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4")
+            .unwrap();
+        assert_eq!(evaluate(&board), evaluate_with(&board, EvalFeatures::all()));
+        for fen in [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R b KQkq - 0 1",
+        ] {
+            let position = Board::from_fen(fen).unwrap();
+            let mirror = Board::from_fen(&mirrored(fen)).unwrap();
+            for features in [
+                EvalFeatures::all(),
+                EvalFeatures::none(),
+                EvalFeatures {
+                    mobility: true,
+                    king_safety: false,
+                    passed_pawn_king_proximity: false,
+                    white_positive_score: false,
+                },
+                EvalFeatures {
+                    mobility: false,
+                    king_safety: true,
+                    passed_pawn_king_proximity: true,
+                    white_positive_score: false,
+                },
+            ] {
+                // The mirrored position hands the move to the other side, so both
+                // readings are the mover's and have to agree.
+                assert_eq!(
+                    evaluate_with(&position, features),
+                    evaluate_with(&mirror, features),
+                    "different score for the mirrored {} with {:?}",
+                    fen,
+                    features
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_orientation_of_the_score_is_the_side_to_moves() {
+        // The search negates whatever a child returns, so a score has to be the
+        // mover's.  This is the test that pins that down: the same imbalance has to
+        // read positive for whoever is up the material, whichever colour that is.
+        for (up, down) in [
+            ("3Qk3/8/8/8/8/8/8/4K3 w - - 0 1", "whoever is to move has a queen"),
+            ("4k3/8/8/8/8/8/8/3qK3 b - - 0 1", "black to move, black has a queen"),
+        ] {
+            let board = Board::from_fen(up).unwrap();
+            let score = evaluate(&board);
+            assert!(
+                score > 700,
+                "{} (mover up a queen) scored {}",
+                down,
+                score
+            );
+        }
+        // And the mirror of the imbalance reads the same way round, because the mover
+        // is the side that is up the material in both readings.
+        let white_up = Board::from_fen("3Qk3/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let black_up = Board::from_fen("4k3/8/8/8/8/8/8/3qK3 b - - 0 1").unwrap();
+        assert!(evaluate(&white_up) > 700 && evaluate(&black_up) > 700);
+        // A side that is *down* a queen has to read negative, which is the case the
+        // first release got backwards.
+        let white_down = Board::from_fen("4k3/8/8/8/8/8/8/3qK3 w - - 0 1").unwrap();
+        let black_down = Board::from_fen("3Qk3/8/8/8/8/8/8/4K3 b - - 0 1").unwrap();
+        assert!(evaluate(&white_down) < -700, "{}", evaluate(&white_down));
+        assert!(evaluate(&black_down) < -700, "{}", evaluate(&black_down));
+    }
+
+    #[test]
+    fn the_orientation_flag_reproduces_the_release_that_got_it_wrong() {
+        // Two positions that differ only in whose turn it is read opposite ways with
+        // the flag off and the same way — white's — with it on.
+        let white_to_move = Board::from_fen("4k3/8/8/8/8/8/8/3QK3 w - - 0 1").unwrap();
+        let black_to_move = Board::from_fen("4k3/8/8/8/8/8/8/3QK3 b - - 0 1").unwrap();
+
+        assert!(evaluate(&white_to_move) > 700);
+        assert!(evaluate(&black_to_move) < -700);
+
+        let shipped = EvalFeatures::as_shipped();
+        assert!(evaluate_with(&white_to_move, shipped) > 700);
+        assert!(
+            evaluate_with(&black_to_move, shipped) > 700,
+            "the flagged reading is white's, whatever the side to move"
+        );
+        // Which also means the flagged reading *is* antisymmetric under mirroring,
+        // the invariant the fixed reading deliberately drops.
+        let startpos = Board::startpos();
+        let mirrored_startpos = Board::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1")
+            .unwrap();
+        assert_eq!(
+            evaluate_with(&mirrored_startpos, shipped),
+            -evaluate_with(&startpos, shipped)
+        );
+        assert_eq!(evaluate(&mirrored_startpos), evaluate(&startpos));
+    }
+
+    #[test]
     fn the_starting_position_is_about_level() {
         let score = evaluate(&Board::startpos());
         assert!(score.abs() <= 60, "start position scored {}", score);
     }
 
     #[test]
-    fn evaluation_is_symmetric_under_colour_reversal() {
-        // Any asymmetry here is a bug in the tables, in the structure terms or in
-        // the tempo bonus.
+    fn evaluation_is_the_same_for_the_mirrored_position() {
+        // The score is the *mover's*, so mirroring a position — swapping the colours
+        // and handing the move to the other side — has to give the same number: the
+        // mover is exactly as well off in the mirrored world, tempo included.  (The
+        // tempting opposite, `score == -mirror`, only holds for an evaluation written
+        // from white's side, which is the mistake the orientation test pins down.)
         for fen in [
             "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
             "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4",
@@ -468,8 +864,8 @@ mod tests {
             let mirror = Board::from_fen(&mirrored(fen)).expect("legal mirrored FEN");
             assert_eq!(
                 evaluate(&board),
-                -evaluate(&mirror),
-                "asymmetric score for {}",
+                evaluate(&mirror),
+                "different score for the mirrored position {}",
                 fen
             );
         }
@@ -482,9 +878,15 @@ mod tests {
         let swing = evaluate(&queen_up) - evaluate(&level);
         assert!(swing > 700, "a queen was worth only {}", swing);
 
-        // The same position with black to move reads as black's advantage.
-        let flipped = evaluate(&Board::from_fen(&mirrored("4k3/8/8/8/8/8/8/3QK3 w - - 0 1")).unwrap());
-        assert!(flipped < -700, "black scored {}", flipped);
+        // The same position with black to move and the queen: the mover is the side
+        // with the queen, so the score is positive again rather than negative.
+        let black_queen_to_move =
+            Board::from_fen("4k3/8/8/8/8/8/8/3qK3 b - - 0 1").unwrap();
+        assert!(
+            evaluate(&black_queen_to_move) > 700,
+            "black scored {}",
+            evaluate(&black_queen_to_move)
+        );
     }
 
     #[test]

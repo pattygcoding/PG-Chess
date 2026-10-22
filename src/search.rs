@@ -29,6 +29,7 @@ use crate::board::{code_kind, Board, NO_PIECE, PAWN};
 use crate::evaluate;
 use crate::movegen;
 use crate::moves::{self, Move, MoveList, MAX_MOVES};
+use crate::see;
 use crate::tt::{TranspositionTable, FLAG_EXACT, FLAG_LOWER, FLAG_UPPER};
 
 /// The deepest line the search will follow, and the size of the killers and PV
@@ -48,6 +49,142 @@ const MVV_VALUES: [i32; 6] = [100, 320, 330, 500, 900, 20_000];
 
 /// How good a promotion is to order by.
 const PROMO_VALUE: [i32; 5] = [0, 320, 330, 500, 900];
+
+/// The exchange value a capture has to reach to be searched in quiescence.
+const SEE_PRUNE_THRESHOLD: i32 = 0;
+
+/// Aspiration window widths, tried in order around the previous iteration's score.
+/// A zero means "the full window", which is the last resort and cannot fail, so a
+/// score that moves further than the widest guess is simply searched normally.
+const ASPIRATION_WINDOWS: [i32; 4] = [25, 100, 400, 0];
+
+/// Futility: how much a quiet move may be worth, per ply of remaining depth, before
+/// it is not worth searching at all.
+const FUTILITY_MARGIN: i32 = 100;
+
+/// Reverse futility: how far above beta the static score must be, per ply, before
+/// the node is cut without searching a single move.
+const REVERSE_FUTILITY_MARGIN: i32 = 90;
+
+/// Late move pruning: how many quiet moves are worth searching at a low depth.
+/// Indexed by depth, so at depth two the twenty-first quiet move onwards is skipped.
+///
+/// Deliberately generous.  An earlier version cut at five moves (depth 1) and ten
+/// (depth 2) and cost the engine 144 Elo at equal depth in the matches: a search that
+/// is three plies deep is not yet good enough at ordering to be sure the twentieth
+/// quiet move is worthless.
+const LATE_MOVE_PRUNING: [usize; 4] = [0, 8, 20, 40];
+
+/// Iterative deepening only seeds the ordering from this depth on, where a blind
+/// first move actually costs something.
+const IID_MINIMUM_DEPTH: i32 = 5;
+
+/// An iteration that cannot finish before the deadline wastes the budget it spends,
+/// because the answer that gets played is the previous depth's.  So a new iteration
+/// is only begun while the search has used less than this share of its time.
+const SOFT_TIME_FRACTION: f64 = 0.55;
+
+/// Which of the search's strength techniques are switched on.
+///
+/// Every one of these is standard, and every one of them trades nodes for work: the
+/// exchange walks cost time at each capture, the reductions risk missing a move that
+/// only looks quiet.  They are flags rather than plain code because the match binary
+/// plays the engine against itself with them on and off, which is the only way to say
+/// whether they made it stronger rather than merely cleverer.
+///
+/// `all()` is the configuration that ships, and it is *not* "every flag true": each
+/// flag below was measured on its own with `match --old full --without <flag>`, 120
+/// games at equal depth and 160 at equal time, and the ones that measured neutral or
+/// worse are off by default even though the code stays behind the flag.
+///
+/// | flag | equal depth | equal time |
+/// | --- | --- | --- |
+/// | `see_pruning` | +137 | |
+/// | `aspiration` | +134 | |
+/// | `king_safety` | +114 | |
+/// | `reverse_futility` | +67 | |
+/// | `passed_pawn_king_proximity` | +67 | |
+/// | `log_reductions` | +23 | +9 |
+/// | `futility` | 0 | -15 |
+/// | `soft_time_limit` | n/a | 0 |
+/// | `mobility` | -20 then -44 | -4 |
+/// | `see_ordering` | -44 | +17 |
+/// | `internal_iterative_deepening` | 0 | -41 |
+/// | `late_move_pruning` | -144, -89 milder | -7 |
+///
+/// The error bars are around ±20, so the top five are wins, `futility` and the soft
+/// time limit are free (they cost nothing measurable and save nodes or waiting), and
+/// the last four earn nothing: they are the interesting negative results.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SearchFeatures {
+    /// Quiescence skips captures that lose material even after the recaptures.
+    pub see_pruning: bool,
+    /// Captures are ordered by exchange value rather than by piece values.  Off: the
+    /// walk costs time at every node and the ordering it produces measured worse than
+    /// the simpler MVV-LVA one.
+    pub see_ordering: bool,
+    /// Each iteration is searched inside a window around the previous score.
+    pub aspiration: bool,
+    /// A node whose static score is far above beta is cut without a search.
+    pub reverse_futility: bool,
+    /// Quiet moves that cannot raise alpha at a low depth are skipped.
+    pub futility: bool,
+    /// The tail of the move list is skipped at a low depth.  Off: at equal depth it
+    /// cost the engine 89 Elo even with a generous cut-off, which is the clearest
+    /// negative result of the set.
+    pub late_move_pruning: bool,
+    /// A node with no move to try first searches itself shallowly to find one.  Off:
+    /// it measured 41 Elo *worse* at equal time, because the table already supplies
+    /// most of the ordering it is there to provide.
+    pub internal_iterative_deepening: bool,
+    /// Reductions follow the log-of-depth-times-log-of-move curve.
+    pub log_reductions: bool,
+    /// Iterations that cannot finish are not started.
+    pub soft_time_limit: bool,
+    /// Which evaluation terms the search asks for.
+    pub eval: evaluate::EvalFeatures,
+}
+
+impl SearchFeatures {
+    pub const fn all() -> Self {
+        SearchFeatures {
+            see_pruning: true,
+            see_ordering: false,
+            aspiration: true,
+            reverse_futility: true,
+            futility: true,
+            late_move_pruning: false,
+            internal_iterative_deepening: false,
+            log_reductions: true,
+            soft_time_limit: true,
+            eval: evaluate::EvalFeatures::all(),
+        }
+    }
+
+    /// The engine as it was before any of the above: the half of the match that the
+    /// other half has to beat.
+    pub const fn baseline() -> Self {
+        SearchFeatures {
+            see_pruning: false,
+            see_ordering: false,
+            aspiration: false,
+            reverse_futility: false,
+            futility: false,
+            late_move_pruning: false,
+            internal_iterative_deepening: false,
+            log_reductions: false,
+            soft_time_limit: false,
+            eval: evaluate::EvalFeatures::none(),
+        }
+    }
+}
+
+impl Default for SearchFeatures {
+    fn default() -> Self {
+        SearchFeatures::all()
+    }
+}
+
 
 /// The three strength settings the UI offers.
 ///
@@ -75,9 +212,9 @@ impl Level {
     /// Depth cap, time budget in milliseconds and the "nearly as good" margin.
     pub fn config(self) -> (i32, u64, i32) {
         match self {
-            Level::Casual => (4, 250, 70),
-            Level::Club => (7, 700, 20),
-            Level::Strong => (10, 1500, 0),
+            Level::Casual => (5, 250, 70),
+            Level::Club => (10, 700, 20),
+            Level::Strong => (14, 1500, 0),
         }
     }
 }
@@ -144,6 +281,22 @@ impl SearchResult {
     }
 }
 
+/// Late move reductions by remaining depth and moves searched: the usual
+/// `0.77 + ln(depth) * ln(move) / 2.36`, floored, and never as deep as the search
+/// itself.  The two logarithms are what give the curve its shape — a fast rise for
+/// the first few moves, then almost flat — and building it once keeps floating point
+/// out of the hot loop.
+fn build_reductions() -> [[i32; 64]; 64] {
+    let mut table = [[0i32; 64]; 64];
+    for (depth, row) in table.iter_mut().enumerate().skip(1) {
+        for (index, cell) in row.iter_mut().enumerate().skip(1) {
+            let value = 0.77 + (depth as f64).ln() * (index as f64).ln() / 2.36;
+            *cell = (value as i32).clamp(0, depth as i32 - 1);
+        }
+    }
+    table
+}
+
 /// Milliseconds since some arbitrary epoch, monotonic within a run.
 ///
 /// The browser reads `performance.now()` through `Date::now`, and a native build
@@ -180,6 +333,12 @@ pub struct Searcher {
     root_scores: [i32; MAX_MOVES],
     /// The current level's "nearly as good" margin in centipawns.
     level_margin: i32,
+    /// Which strength techniques are switched on.  Everything the search does
+    /// differently from the version before it lives behind one of these flags.
+    features: SearchFeatures,
+    /// Late move reductions by remaining depth and moves searched, from the usual
+    /// log-of-both curve.  Built once, since the curve needs floating point.
+    reductions: [[i32; 64]; 64],
     pub nodes: u64,
     stopped: bool,
     start_ms: f64,
@@ -197,11 +356,23 @@ impl Searcher {
             root_moves: MoveList::new(),
             root_scores: [0; MAX_MOVES],
             level_margin: 0,
+            features: SearchFeatures::all(),
+            reductions: build_reductions(),
             nodes: 0,
             stopped: false,
             start_ms: 0.0,
             deadline_ms: 0.0,
         }
+    }
+
+    /// Chooses which techniques the search uses.  The default is everything on;
+    /// the matches ask for `SearchFeatures::baseline()` on one side.
+    pub fn set_features(&mut self, features: SearchFeatures) {
+        self.features = features;
+    }
+
+    pub fn features(&self) -> SearchFeatures {
+        self.features
     }
 
     /// Resizes the transposition table, in megabytes.
@@ -247,7 +418,7 @@ impl Searcher {
             return SearchResult {
                 best,
                 pv: vec![best],
-                score: evaluate::evaluate(board),
+                score: evaluate::evaluate_with(board, self.features.eval),
                 depth: 1,
                 nodes: 1,
                 time_ms: 1,
@@ -258,7 +429,17 @@ impl Searcher {
         let mut result = SearchResult::empty();
 
         for depth in 1..=limits.max_depth {
-            let score = self.search_root(board, depth);
+            // An iteration takes longer than the one before it, so once most of the
+            // budget is gone the next one is likely to be cut off, and a cut-off
+            // iteration changes nothing about the answer.  Better to have spent the
+            // time finishing the depth in hand.
+            if self.features.soft_time_limit
+                && depth > 1
+                && now_ms() - self.start_ms > limits.time_ms as f64 * SOFT_TIME_FRACTION
+            {
+                break;
+            }
+            let score = self.search_root(board, depth, result.score);
             if self.stopped {
                 break;
             }
@@ -277,7 +458,7 @@ impl Searcher {
         if result.best == 0 {
             result.best = self.root_moves.get(0);
             result.pv = vec![result.best];
-            result.score = evaluate::evaluate(board);
+            result.score = evaluate::evaluate_with(board, self.features.eval);
             result.depth = result.depth.max(1);
         }
 
@@ -289,15 +470,60 @@ impl Searcher {
         result
     }
 
-    /// One iteration: every root move, keeping the best and the PV.
-    fn search_root(&mut self, board: &mut Board, depth: i32) -> i32 {
+    /// One iteration, with the aspiration window wrapped around it.
+    ///
+    /// Most iterations land within a pawn of the previous one, and a narrow window
+    /// prunes harder than a wide one, so the iteration is tried inside
+    /// `previous ± 25` first and only widened when that guess turns out to be wrong.
+    /// A wrong guess costs the iteration, not the answer: the iteration is re-searched
+    /// inside the next width, and the last width is the full window, which cannot
+    /// fail.
+    fn search_root(&mut self, board: &mut Board, depth: i32, previous: i32) -> i32 {
+        let mut score = previous;
+        for window in ASPIRATION_WINDOWS {
+            // The first iterations are cheap enough to search exactly, and a mate
+            // score is not a score a window around it means anything for.  A level
+            // that weakens its choice also searches the full window, because it has to
+            // score every move near the top exactly to pick between them.
+            let narrow = self.features.aspiration
+                && depth > 2
+                && window > 0
+                && previous.abs() < MATE_THRESHOLD
+                && self.level_margin == 0;
+            let (alpha, beta) = if narrow {
+                (previous.saturating_sub(window), previous.saturating_add(window))
+            } else {
+                (-INFINITY, INFINITY)
+            };
+
+            let (value, failed_low, failed_high) =
+                self.search_root_window(board, depth, alpha, beta);
+            score = value;
+            if self.stopped || (!failed_low && !failed_high) {
+                return score;
+            }
+        }
+        score
+    }
+
+    /// Every root move for one depth, inside an explicit window.
+    ///
+    /// Returns the score, and whether it landed outside the window on either side,
+    /// which is what the caller needs to know to widen it and try again.
+    fn search_root_window(
+        &mut self,
+        board: &mut Board,
+        depth: i32,
+        alpha: i32,
+        beta: i32,
+    ) -> (i32, bool, bool) {
         let key = board.hash;
         let tt_move = self.tt.probe(key).map(|probe| probe.mv).unwrap_or(0);
         self.order_root_moves(board, tt_move);
         self.pv_length[0] = 0;
 
-        let mut alpha = -INFINITY;
-        let beta = INFINITY;
+        let mut alpha = alpha;
+        let alpha_floor = alpha;
         let mut best_score = -INFINITY;
         let mut searched = 0;
 
@@ -309,12 +535,25 @@ impl Searcher {
 
             // The first move gets the full window; every other one is probed with
             // a null window first and only widened when it beats alpha.
+            // The bar a move has to clear to be worth searching exactly.  It is alpha —
+            // the best score so far — except at a level that weakens its choice, where
+            // it is the margin *below* the best.  A score from a probe at alpha is only
+            // an upper bound, so probing there makes every move that fails look as
+            // though it were one centipawn from the best one, which is how a "within
+            // twenty-five centipawns" level ends up playing moves twenty-five
+            // centipawns *and a queen* worse.
+            let bar = if self.level_margin > 0 {
+                (best_score - self.level_margin).max(-INFINITY + 1)
+            } else {
+                alpha
+            };
             let score = if searched == 0 {
                 -self.negamax(board, depth - 1, -beta, -alpha, 1, true)
             } else {
-                let probe = -self.negamax(board, depth - 1, -alpha - 1, -alpha, 1, true);
-                if probe > alpha && !self.stopped {
-                    -self.negamax(board, depth - 1, -beta, -alpha, 1, true)
+                let probe = -self.negamax(board, depth - 1, -bar - 1, -bar, 1, true);
+                if probe > bar && !self.stopped {
+                    // Close enough to matter: its exact value decides the choice.
+                    -self.negamax(board, depth - 1, -beta, -bar, 1, true)
                 } else {
                     probe
                 }
@@ -322,7 +561,7 @@ impl Searcher {
             board.unmake_move();
 
             if self.stopped {
-                return best_score;
+                return (best_score, false, false);
             }
             searched += 1;
             self.root_scores[index] = score;
@@ -333,25 +572,33 @@ impl Searcher {
             if score > alpha {
                 alpha = score;
                 // The child's PV becomes this node's PV, with this move in front.
-                // `pv_length[1]` is "the number of moves from ply 1 down", whose
-                // first entry is index 1 by the convention used in `negamax`.
-                let child_length = self.pv_length[1].min(MAX_PLY);
                 self.pv_table[0][0] = mv;
-                for index in 1..child_length {
-                    self.pv_table[0][index] = self.pv_table[1][index];
+                let child_moves = self.pv_length[1].min(MAX_PLY - 1);
+                for step in 0..child_moves {
+                    self.pv_table[0][step + 1] = self.pv_table[1][step];
                 }
-                self.pv_length[0] = child_length.max(1);
+                self.pv_length[0] = child_moves + 1;
             }
         }
 
+        // The flag has to describe the window that was actually searched: a score
+        // from a failed probe is a bound, not an exact value, and storing it as
+        // exact would poison the table for every later visit.
+        let flag = if best_score >= beta {
+            FLAG_LOWER
+        } else if best_score > alpha_floor {
+            FLAG_EXACT
+        } else {
+            FLAG_UPPER
+        };
         self.tt.store(
             key,
             self.pv_table[0][0],
             score_to_tt(best_score, 0),
             depth,
-            FLAG_EXACT,
+            flag,
         );
-        best_score
+        (best_score, best_score <= alpha_floor, best_score >= beta)
     }
 
     /// Tries the table's move first, then the moves the previous iteration liked,
@@ -372,7 +619,7 @@ impl Searcher {
                 // Last iteration's scores come next, keeping their relative order.
                 previous as i64 + 500_000_000
             } else {
-                self.move_score(board, mv, 0, 0) as i64 + 100_000_000
+                self.move_score(board, mv, 0, 0, self.features.see_ordering) as i64 + 100_000_000
             };
             *entry = (mv, priority);
         }
@@ -400,8 +647,17 @@ impl Searcher {
     ///
     /// The buckets are far apart on purpose: a table move always outranks any
     /// capture, a capture any promotion, and so on down to the history counter,
-    /// which only has to order quiet moves against each other.
-    fn move_score(&self, board: &Board, mv: Move, tt_move: Move, ply: usize) -> i32 {
+    /// which only has to order quiet moves against each other.  `by_exchange` asks
+    /// for the exchange value of captures, which is a walk and is therefore not worth
+    /// paying for inside quiescence, where the losing ones have already been pruned.
+    fn move_score(
+        &self,
+        board: &Board,
+        mv: Move,
+        tt_move: Move,
+        ply: usize,
+        by_exchange: bool,
+    ) -> i32 {
         if mv == tt_move && tt_move != 0 {
             return 1_000_000;
         }
@@ -419,13 +675,23 @@ impl Searcher {
             && moves::is_diagonal(mv);
 
         if victim != NO_PIECE || is_en_passant {
-            // MVV-LVA: the most valuable victim taken by the least valuable
-            // attacker first, which is what makes captures pay for themselves.
             let victim_value = if is_en_passant {
                 MVV_VALUES[PAWN]
             } else {
                 MVV_VALUES[code_kind(victim)]
             };
+            if by_exchange && !is_en_passant && !moves::is_promotion(mv) {
+                // MVV-LVA guesses what a capture is worth from the two pieces on the
+                // square it starts on; the exchange value walks the whole sequence
+                // and is the better guess.  Both parts are clamped into the capture
+                // band, so every capture still outranks every promotion and quiet
+                // move, which is the ordering the rest of the search expects.
+                let exchange = see::see_value(board, mv).clamp(-1_000, 1_000);
+                let material = (victim_value - MVV_VALUES[code_kind(attacker)]).clamp(-100, 100);
+                return 900_000 + exchange * 10 + material;
+            }
+            // MVV-LVA: the most valuable victim taken by the least valuable
+            // attacker first, which is what makes captures pay for themselves.
             return 900_000 + victim_value * 10 - MVV_VALUES[code_kind(attacker)];
         }
         if moves::is_promotion(mv) {
@@ -453,9 +719,9 @@ impl Searcher {
         ply: usize,
         allow_null: bool,
     ) -> i32 {
-        // `pv_length[ply] = ply` is the "no moves in this line yet" marker; the
-        // root and every improving node overwrite it on the way out.
-        self.pv_length[ply] = ply;
+        // `pv_length[ply] = 0` is the "no moves in this line yet" marker; the root and
+        // every node that improves alpha overwrite it on the way out.
+        self.pv_length[ply] = 0;
 
         if self.check_time() {
             return 0;
@@ -496,7 +762,7 @@ impl Searcher {
 
         let key = board.hash;
         let probe = self.tt.probe(key);
-        let tt_move = probe.map(|entry| entry.mv).unwrap_or(0);
+        let mut tt_move = probe.map(|entry| entry.mv).unwrap_or(0);
         let is_pv = beta - alpha > 1;
         if let Some(entry) = probe {
             if !is_pv && entry.depth >= depth {
@@ -510,7 +776,39 @@ impl Searcher {
             }
         }
 
-        let static_eval = evaluate::evaluate(board);
+        let static_eval = evaluate::evaluate_with(board, self.features.eval);
+
+        // Internal iterative deepening: with no move to try first, every move is
+        // ordered blind, and a shallow search is the cheapest way to find out which
+        // one deserves the full depth.  Its score is thrown away; only the move
+        // matters, and it lands in the table where the ordering below reads it.
+        if self.features.internal_iterative_deepening
+            && tt_move == 0
+            && is_pv
+            && !in_check
+            && depth >= IID_MINIMUM_DEPTH
+        {
+            self.negamax(board, depth / 2, alpha, beta, ply, false);
+            if self.stopped {
+                return 0;
+            }
+            tt_move = self.tt.probe(key).map(|entry| entry.mv).unwrap_or(0);
+        }
+
+        // Reverse futility: the static score is so far above beta that the opponent
+        // would have to be handed two free moves to bring the node back into range.
+        // Shallow depths only, and never in a pawn ending, where "passing" is exactly
+        // the move that loses.
+        if self.features.reverse_futility
+            && !is_pv
+            && !in_check
+            && depth <= 5
+            && static_eval < MATE_THRESHOLD
+            && static_eval - REVERSE_FUTILITY_MARGIN * depth >= beta
+            && has_non_pawn_material(board, board.side_to_move())
+        {
+            return static_eval;
+        }
 
         // Null-move pruning: hand the opponent a free move and ask whether the
         // position is still too good for them.  Skipped in check (passing out of
@@ -542,7 +840,7 @@ impl Searcher {
         movegen::generate_pseudo_legal(board, &mut moves);
         let mut scores = [0i32; MAX_MOVES];
         for (index, mv) in moves.as_slice().iter().enumerate() {
-            scores[index] = self.move_score(board, *mv, tt_move, ply);
+            scores[index] = self.move_score(board, *mv, tt_move, ply, self.features.see_ordering);
         }
 
         let original_alpha = alpha;
@@ -574,6 +872,37 @@ impl Searcher {
                 && moves::is_diagonal(mv);
             let quiet = board.piece_on(to) == NO_PIECE && !en_passant && !moves::is_promotion(mv);
 
+            // Two pruning rules for quiet moves, both only at low depth, only away
+            // from check, and never at a PV node, where any move might be the one
+            // that matters:
+            //
+            // * Late move pruning: the list is ordered, so a quiet move this far
+            //   down it is not going to be the best one at depth three.
+            // * Futility: the position is already so far below alpha that a quiet
+            //   move worth less than the margin cannot bring it back.
+            if self.features.late_move_pruning
+                && !is_pv
+                && !in_check
+                && quiet
+                && legal > 0
+                && depth <= 3
+                && legal >= LATE_MOVE_PRUNING[depth as usize]
+            {
+                index += 1;
+                continue;
+            }
+            if self.features.futility
+                && !is_pv
+                && !in_check
+                && quiet
+                && legal > 0
+                && depth <= 3
+                && static_eval + FUTILITY_MARGIN * depth <= alpha
+            {
+                index += 1;
+                continue;
+            }
+
             if !board.make_move(mv) {
                 // Illegal: it would leave our king in check.
                 index += 1;
@@ -590,7 +919,11 @@ impl Searcher {
                 // is unlikely to be best, so it gets a shallower look first and is
                 // re-searched at full depth only when that look beats alpha.
                 let reduction = if quiet && depth >= 3 && legal >= 3 {
-                    1 + i32::from(legal >= 8)
+                    if self.features.log_reductions {
+                        self.reductions[(depth.min(63)) as usize][legal.min(63)]
+                    } else {
+                        1 + i32::from(legal >= 8)
+                    }
                 } else {
                     0
                 };
@@ -630,11 +963,15 @@ impl Searcher {
             if score > alpha {
                 alpha = score;
                 self.pv_table[ply][0] = mv;
-                let child_length = self.pv_length[ply + 1].min(MAX_PLY);
-                for child in ply + 1..child_length {
-                    self.pv_table[ply][child - ply] = self.pv_table[ply + 1][child];
+                // The child's line, one move longer with this move in front.  The
+                // count is what matters: the child's row always starts at index 0, and
+                // a child that returned through a table hit has no line to copy, so
+                // the length decides how much of the row is real.
+                let child_moves = self.pv_length[ply + 1].min(MAX_PLY - ply - 1);
+                for step in 0..child_moves {
+                    self.pv_table[ply][step + 1] = self.pv_table[ply + 1][step];
                 }
-                self.pv_length[ply] = child_length.max(ply + 1);
+                self.pv_length[ply] = child_moves + 1;
 
                 if alpha >= beta {
                     // A cutoff on a quiet move means it is worth trying early in
@@ -706,7 +1043,7 @@ impl Searcher {
         }
         let mut scores = [0i32; MAX_MOVES];
         for (index, mv) in moves.as_slice().iter().enumerate() {
-            scores[index] = self.move_score(board, *mv, 0, ply);
+            scores[index] = self.move_score(board, *mv, 0, ply, false);
         }
 
         let mut best = stand_pat;
@@ -738,8 +1075,10 @@ impl Searcher {
             //
             // * Delta pruning: even taking the victim for free would leave the
             //   node short of alpha, so the exchange cannot change the answer.
-            // * Losing captures: taking a pawn with a queen, where the queen is
-            //   likely to be recaptured, is not worth a node either.
+            // * Losing captures: a capture that the exchange says loses material is
+            //   not worth a node, whatever the two piece values suggest.  (Without
+            //   the exchange evaluator this falls back to comparing the victim's
+            //   value against the attacker's.)
             if !in_check {
                 let mut gain = if en_passant {
                     MVV_VALUES[PAWN]
@@ -755,9 +1094,16 @@ impl Searcher {
                     index += 1;
                     continue;
                 }
-                if !en_passant && !moves::is_promotion(mv) && gain + 150 < MVV_VALUES[code_kind(attacker)] {
-                    index += 1;
-                    continue;
+                if !en_passant && !moves::is_promotion(mv) {
+                    if self.features.see_pruning {
+                        if !see::see_ge(board, mv, SEE_PRUNE_THRESHOLD) {
+                            index += 1;
+                            continue;
+                        }
+                    } else if gain + 150 < MVV_VALUES[code_kind(attacker)] {
+                        index += 1;
+                        continue;
+                    }
                 }
             }
 
@@ -816,11 +1162,17 @@ impl Searcher {
             return;
         }
 
+        // Candidates are the moves the search scored *strictly* inside the margin.  The
+        // comparison has to be strict: a move whose probe failed is scored at exactly the
+        // bar — that is what a bounded probe returns — so an inclusive test would offer
+        // moves the search believes are far worse than the margin allows, and
+        // `every_move_the_weakening_offers_is_really_within_its_margin` is the test that
+        // says so.
         let mut candidates = 0;
         for index in 0..self.root_moves.len() {
             let mv = self.root_moves.get(index);
             let score = self.root_scores[index];
-            if mv != 0 && score != 0 && score >= result.score - margin {
+            if mv != 0 && score != 0 && score > result.score - margin {
                 candidates += 1;
             }
         }
@@ -828,19 +1180,34 @@ impl Searcher {
             return;
         }
 
-        // A small deterministic step from the position's own key: the same board
-        // always picks the same move, so a loss is reproducible.
-        let mut state = board.hash ^ (self.nodes << 7);
+        // A deterministic step from the position's own key: the same board always picks
+        // the same move, so a loss is reproducible.  Nothing about the search's own
+        // effort goes into it — a level that played differently depending on how many
+        // nodes it happened to visit would not be reproducible at all.
+        let mut state = board.hash;
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
-        let pick = (state as usize) % candidates;
+
+        // The draw is triangular over the candidates in the order the search would try
+        // them, which is the previous iteration's ranking: the best move comes up most
+        // often, the next one less, and so on.  Drawing uniformly instead is what makes
+        // a weakened level play the fifteenth-best move as readily as the best one, and
+        // in an opening, where fifteen moves sit inside a quarter of a pawn, that is a
+        // knight to the rim.
+        let total = candidates * (candidates + 1) / 2;
+        let mut draw = (state % total as u64) as usize;
+        let mut pick = 0;
+        while draw >= candidates - pick {
+            draw -= candidates - pick;
+            pick += 1;
+        }
 
         let mut seen = 0;
         for index in 0..self.root_moves.len() {
             let mv = self.root_moves.get(index);
             let score = self.root_scores[index];
-            if mv == 0 || score == 0 || score < result.score - margin {
+            if mv == 0 || score == 0 || score <= result.score - margin {
                 continue;
             }
             if seen == pick {
@@ -983,7 +1350,18 @@ mod tests {
             assert_eq!(board.hash, board.compute_hash());
             played += 1;
         }
-        assert!(played >= 30, "self-play stopped after {} plies", played);
+        // The content of this test is the legality of every move and the hash staying
+        // consistent with the position (both asserted above).  Length is only a sanity
+        // check that the engine is playing rather than falling over: a short game is
+        // fine when it ends by a rule — a mate at ply twenty-nine is a result, not a
+        // bug — but a game that stops early while still in play is not.
+        let outcome = board.outcome();
+        assert!(
+            played >= 30 || outcome.is_over(),
+            "self-play stopped after {} plies still {}",
+            played,
+            outcome.slug()
+        );
     }
 
     #[test]
@@ -1010,13 +1388,23 @@ mod tests {
 
     #[test]
     fn the_levels_differ_in_how_deep_and_how_long_they_search() {
-        for (level, expected_cap) in [(0u32, 4), (1, 7), (2, 10)] {
+        for (level, expected_cap) in [(0u32, 5), (1, 10), (2, 14)] {
             let (cap, _, _) = Level::from_number(level).config();
             assert_eq!(cap, expected_cap);
         }
+        // And each level is more permissive than the one below it, in depth, time and
+        // how close to the best move it insists on playing.
+        let levels = [Level::Casual, Level::Club, Level::Strong];
+        for pair in levels.windows(2) {
+            let (cap, time, margin) = pair[0].config();
+            let (next_cap, next_time, next_margin) = pair[1].config();
+            assert!(cap < next_cap, "{:?} is not shallower than {:?}", pair[0], pair[1]);
+            assert!(time <= next_time);
+            assert!(margin > next_margin);
+        }
         // A depth of zero means "whatever this level is for".
         let limits = SearchLimits::new(0, 0, 1);
-        assert_eq!(limits.max_depth, 7);
+        assert_eq!(limits.max_depth, 10);
         assert_eq!(limits.time_ms, 700);
         // An explicit request wins.
         let limits = SearchLimits::new(3, 120, 0);
@@ -1056,6 +1444,143 @@ mod tests {
         assert!(board.make_move(result.best));
         assert_eq!(board.hash, board.compute_hash());
     }
+
+    #[test]
+    fn a_hanging_queen_is_taken_with_black_to_move_too() {
+        // The mirror of `a_hanging_queen_is_taken`: the same hunt from the other side,
+        // with enough material left on the board that the win is real rather than a
+        // dead draw.  This is the shape of test that catches a score written from
+        // white's side rather than from the mover's, because for black the whole
+        // search comes out upside down and the engine prefers its own worst move.
+        let (mut board, result) = search_fen("2r1k3/8/2n5/8/3Q4/8/8/4K3 b - - 0 1", 6, 3000, 2);
+        assert_eq!(
+            moves::to_uci(result.best),
+            "c6d4",
+            "black should take the queen"
+        );
+        assert!(board.make_move(result.best));
+        assert_eq!(board.pieces_of(crate::board::WHITE, crate::board::QUEEN), 0);
+        assert!(result.score > 400, "black scored only {}", result.score);
+    }
+
+    #[test]
+    fn the_search_never_prefers_its_own_worst_move() {
+        // The same position twice, mirrored: each time the side to move can win a
+        // queen with a knight, and each time the search has to see a big win for the
+        // mover.  One number above zero from each side is exactly what cannot happen
+        // when the evaluation is written from white's side.
+        for (fen, expected) in [
+            ("4k3/8/8/3q4/8/2N5/8/2R1K3 w - - 0 1", "c3d5"),
+            ("2r1k3/8/2n5/8/3Q4/8/8/4K3 b - - 0 1", "c6d4"),
+        ] {
+            let (_, result) = search_fen(fen, 4, 3000, 2);
+            assert_eq!(moves::to_uci(result.best), expected, "in {}", fen);
+            assert!(result.score > 300, "{} scored {}", fen, result.score);
+        }
+    }
+
+    #[test]
+    fn the_principal_variation_is_a_legal_line() {
+        // The PV is what the UI shows as the engine's plan and what the analysis
+        // reads, so every move in it has to be playable in turn.
+        for fen in [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "4k3/8/8/3q4/8/2n5/8/3QK3 b - - 0 1",
+        ] {
+            let (mut board, result) = search_fen(fen, 6, 3000, 2);
+            assert!(!result.pv.is_empty(), "{} produced no line", fen);
+            assert_eq!(result.pv[0], result.best, "{} PV starts elsewhere", fen);
+            for (step, mv) in result.pv.iter().enumerate() {
+                assert_ne!(*mv, 0, "{} has an empty move at step {}", fen, step);
+                assert!(
+                    board.make_move(*mv),
+                    "{} plays the illegal move {} at step {}",
+                    fen,
+                    moves::to_uci(*mv),
+                    step
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_weakened_level_still_takes_a_free_queen() {
+        // The weakening picks among moves within a margin of the best one, and that must
+        // never reach far enough to miss a piece.  Both weakened levels have to take a
+        // queen standing in front of a knight, where the capture is nine pawns clear of
+        // every alternative: the band cannot contain anything else.
+        for level in [0u32, 1] {
+            let (mut board, result) = search_fen("4k3/8/8/3q4/8/2N5/8/2R1K3 w - - 0 1", 6, 3_000, level);
+            assert_eq!(
+                moves::to_uci(result.best),
+                "c3d5",
+                "level {} missed the queen",
+                level
+            );
+            assert!(board.make_move(result.best));
+            assert_eq!(board.pieces_of(crate::board::BLACK, crate::board::QUEEN), 0);
+        }
+    }
+
+    #[test]
+    fn every_move_the_weakening_offers_is_really_within_its_margin() {
+        // The claim is that a move the level is willing to play is within `margin` of
+        // the best.  The way to check a claim like that is to re-score every root move
+        // with a full window — the truth the weakening is approximating — and compare.
+        let (_, _, margin) = Level::Club.config();
+        assert!(margin > 0, "this test is about a weakened level");
+        let depth = 6;
+        let mut board = Board::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .unwrap();
+        let mut searcher = Searcher::new(16);
+        let limits = SearchLimits {
+            max_depth: depth,
+            time_ms: 86_400_000,
+            level: Level::Club,
+        };
+        searcher.search(&mut board, limits);
+
+        let mut rescored = Vec::new();
+        for index in 0..searcher.root_moves.len() {
+            let mv = searcher.root_moves.get(index);
+            let recorded = searcher.root_scores[index];
+            if !board.make_move(mv) {
+                continue;
+            }
+            let exact = -searcher.negamax(&mut board, depth - 1, -INFINITY, INFINITY, 1, true);
+            board.unmake_move();
+            rescored.push((mv, recorded, exact));
+        }
+        let best = rescored
+            .iter()
+            .map(|(_, _, exact)| *exact)
+            .max()
+            .expect("moves to score");
+
+        let mut offered = 0;
+        for (mv, recorded, exact) in rescored {
+            // Strictly inside the margin, which is what the weakening offers: a move
+            // whose probe failed is scored exactly at the bar, and that is not the same
+            // as being within the margin.
+            if recorded > best - margin {
+                offered += 1;
+                assert!(
+                    exact >= best - margin,
+                    "{} was offered as near-best: recorded {} but really {} against a best of {}",
+                    moves::to_uci(mv),
+                    recorded,
+                    exact,
+                    best
+                );
+            }
+        }
+        assert!(offered >= 1, "no move was offered at all");
+    }
+
     #[test]
     fn the_time_budget_is_respected() {
         let mut board = Board::from_fen(

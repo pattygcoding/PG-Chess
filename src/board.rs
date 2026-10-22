@@ -334,6 +334,19 @@ impl Board {
         self.pieces[kind] & self.colour[colour]
     }
 
+    /// One colour's whole army, which the evaluator's mobility term subtracts so it
+    /// counts squares a piece can actually move to.
+    #[inline]
+    pub fn colour_of(&self, colour: usize) -> Bitboard {
+        self.colour[colour]
+    }
+
+    /// Where one side's king stands.  A legal position always has exactly one.
+    #[inline]
+    pub fn king_square(&self, colour: usize) -> usize {
+        self.kings[colour]
+    }
+
     #[inline]
     pub fn piece_on(&self, sq: usize) -> u8 {
         self.mailbox[sq]
@@ -369,6 +382,8 @@ impl Board {
     pub fn is_attacked(&self, sq: usize, by: usize) -> bool {
         let occupied = self.occupied();
         let theirs = self.colour[by];
+        // Ordered cheapest first and short-circuiting on a hit: this is one of the
+        // hottest calls in the engine, because every `make_move` asks it once.
         if pawn_attackers(sq, by) & self.pieces[PAWN] & theirs != 0 {
             return true;
         }
@@ -386,6 +401,21 @@ impl Board {
             return true;
         }
         false
+    }
+
+    /// Every piece of colour `colour` that attacks `sq`, given an occupancy.
+    ///
+    /// The occupancy is a parameter because the exchange evaluator removes pieces
+    /// as it walks a capture sequence, and a slider behind the piece it just took
+    /// becomes an attacker only after that piece is gone.
+    pub fn attackers_to(&self, sq: usize, colour: usize, occupied: Bitboard) -> Bitboard {
+        let theirs = self.colour[colour];
+        let queens = self.pieces[QUEEN] & theirs;
+        pawn_attackers(sq, colour) & self.pieces[PAWN] & theirs
+            | knight_attacks(sq) & self.pieces[KNIGHT] & theirs
+            | king_attacks(sq) & self.pieces[KING] & theirs
+            | rook_attacks(sq, occupied) & (self.pieces[ROOK] | queens) & theirs
+            | bishop_attacks(sq, occupied) & (self.pieces[BISHOP] | queens) & theirs
     }
 
     /// Plays `mv` if it is legal, and says whether it was.
@@ -492,6 +522,17 @@ impl Board {
 
         self.hash = hash;
         self.history.push(hash);
+    }
+
+    /// Plays `mv` without asking whether it leaves the king in check.
+    ///
+    /// The search always goes through `make_move`, which is the legality gate.  The
+    /// exchange evaluator is deliberately static — it ignores pins — and its
+    /// reference implementation in the tests has to reproduce that rule by playing
+    /// the sequence for real, which is what this is for.
+    #[cfg(test)]
+    pub(crate) fn make_move_unchecked(&mut self, mv: Move) {
+        self.apply(mv);
     }
 
     /// Takes the last move back.  Returns false when there is nothing to undo.
