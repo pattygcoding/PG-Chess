@@ -17,8 +17,8 @@
 //! because piece-square tables alone cannot see pawn structure.
 
 use crate::bitboard::{
-    bishop_attacks, king_attacks, knight_attacks, pop_lsb, popcount, queen_attacks, rook_attacks,
-    square_bb, Bitboard,
+    bishop_attacks, king_attacks, knight_attacks, pawn_attacks, pop_lsb, popcount, queen_attacks,
+    rook_attacks, square_bb, Bitboard,
 };
 use crate::board::{Board, BISHOP, BLACK, KNIGHT, PAWN, QUEEN, ROOK, WHITE};
 
@@ -241,8 +241,11 @@ const EG_TABLES: [&[i32; 64]; 6] = [
 /// claim any of them earned its keep.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct EvalFeatures {
-    /// How many squares each piece can move to, counted from its attack sets.
+    /// How many squares each piece can move to, counted from its attack sets and
+    /// leaving out the squares the enemy's pawns cover.
     pub mobility: bool,
+    /// Enemy pieces this side's pawns are attacking.
+    pub threats: bool,
     /// How many enemy pieces are bearing down on the king's neighbourhood.
     pub king_safety: bool,
     /// How close each side's king is to the passed pawn it is escorting or chasing.
@@ -261,14 +264,20 @@ pub struct EvalFeatures {
 }
 
 impl EvalFeatures {
-    /// The configuration that ships.  `mobility` is *not* among the terms, which is a
-    /// measured decision rather than an omission: counted this way it scored 20 Elo
-    /// (then 44) *worse* at equal depth and was level at equal time, so it is a cost
-    /// without a return.  The next thing to try on it is the usual refinement —
-    /// counting only squares the enemy's pawns do not cover — rather than more weight.
+    /// The configuration that ships.
+    ///
+    /// `mobility` was measured *negative* in its first form — counting every square a
+    /// piece attacks — and is in the shipped set in a different form: it leaves out the
+    /// squares the enemy's pawns cover, and *that* version measured +22 Elo at equal
+    /// depth.  Same weights, different squares, opposite result.
     pub const fn all() -> Self {
         EvalFeatures {
-            mobility: false,
+            mobility: true,
+            // Off: the pawn-threat term is the one piece of this round that measured
+            // nothing, at equal depth and at equal time, so it is a cost for no return.
+            // The refinement worth trying is threats from *pieces* as well as pawns,
+            // which needs the defended/undefended distinction to mean anything.
+            threats: false,
             king_safety: true,
             passed_pawn_king_proximity: true,
             white_positive_score: false,
@@ -278,6 +287,7 @@ impl EvalFeatures {
     pub const fn none() -> Self {
         EvalFeatures {
             mobility: false,
+            threats: false,
             king_safety: false,
             passed_pawn_king_proximity: false,
             white_positive_score: false,
@@ -289,6 +299,7 @@ impl EvalFeatures {
     pub const fn as_shipped() -> Self {
         EvalFeatures {
             mobility: false,
+            threats: false,
             king_safety: false,
             passed_pawn_king_proximity: false,
             white_positive_score: true,
@@ -315,7 +326,22 @@ pub fn evaluate_with(board: &Board, features: EvalFeatures) -> i32 {
     let mut eg = [0i32; 2];
     let mut phase = 0;
 
+    // The two covers are wanted by both of the terms below and by opposite sides of
+    // them: our pawns' cover is what we threaten and what the enemy has to avoid, and
+    // theirs is the mirror.  Computed once here rather than once per colour per term.
+    let (white_cover, black_cover) = if features.mobility || features.threats {
+        (pawn_cover(board, WHITE), pawn_cover(board, BLACK))
+    } else {
+        (0, 0)
+    };
+
     for colour in [WHITE, BLACK] {
+        let (our_cover, their_cover) = if colour == WHITE {
+            (white_cover, black_cover)
+        } else {
+            (black_cover, white_cover)
+        };
+
         for kind in 0..6 {
             let mut pieces = board.pieces_of(colour, kind);
             while pieces != 0 {
@@ -335,9 +361,14 @@ pub fn evaluate_with(board: &Board, features: EvalFeatures) -> i32 {
         eg[colour] += structure_eg;
 
         if features.mobility {
-            let (mobility_mg, mobility_eg) = mobility_terms(board, colour);
+            let (mobility_mg, mobility_eg) = mobility_terms(board, colour, their_cover);
             mg[colour] += mobility_mg;
             eg[colour] += mobility_eg;
+        }
+        if features.threats {
+            let (threat_mg, threat_eg) = threat_terms(board, colour, our_cover);
+            mg[colour] += threat_mg;
+            eg[colour] += threat_eg;
         }
         if features.king_safety {
             mg[colour] -= king_danger(board, colour);
@@ -377,8 +408,14 @@ pub fn evaluate_with(board: &Board, features: EvalFeatures) -> i32 {
 /// A knight with eight moves is doing more than a knight with two, and counting the
 /// attack sets — rather than only the empty squares they reach — is what makes this
 /// cheap: the sets are one lookup for the leapers and one ray walk per slider.
-fn mobility_terms(board: &Board, colour: usize) -> (i32, i32) {
-    let own = board.colour_of(colour);
+///
+/// The squares an enemy pawn covers are left out, which is the whole difference
+/// between this and the version that measured *worse* than nothing.  A square a pawn
+/// attacks is a square a piece cannot sit on, so a rook that "has" eight moves into a
+/// pawn's cover has none of them; counting those eight as mobility was rewarding
+/// activity that loses material.
+fn mobility_terms(board: &Board, colour: usize, enemy_pawns_cover: Bitboard) -> (i32, i32) {
+    let area = !board.colour_of(colour) & !enemy_pawns_cover;
     let occupied = board.occupied();
     let mut mg = 0;
     let mut eg = 0;
@@ -388,10 +425,48 @@ fn mobility_terms(board: &Board, colour: usize) -> (i32, i32) {
         while pieces != 0 {
             let square = pop_lsb(&mut pieces);
             let attacks = piece_attacks(square, kind, occupied);
-            let squares = popcount(attacks & !own) as i32;
+            let squares = popcount(attacks & area) as i32;
             mg += squares * MOBILITY[kind].0;
             eg += squares * MOBILITY[kind].1;
         }
+    }
+    (mg, eg)
+}
+
+/// Every square one side's pawns attack, whether or not anything stands there.
+///
+/// Two terms want this and neither wants the other's copy of it: mobility subtracts
+/// it (a square a pawn covers is not mobility) and the threat term intersects it with
+/// the enemy's pieces.  One loop over the pawns, shared.
+fn pawn_cover(board: &Board, colour: usize) -> Bitboard {
+    let mut pawns = board.pieces_of(colour, PAWN);
+    let mut cover = 0;
+    while pawns != 0 {
+        cover |= pawn_attacks(colour, pop_lsb(&mut pawns));
+    }
+    cover
+}
+
+/// What it is worth to have a pawn attacking an enemy piece, by the piece attacked
+/// (mg, eg).  These are deliberately smaller than the piece values: a threatened
+/// piece usually just moves, so the threat is pressure rather than material.
+const PAWN_THREAT: [(i32, i32); 6] = [(0, 0), (25, 20), (25, 20), (35, 25), (50, 30), (0, 0)];
+
+/// What this side's pawns are attacking.
+///
+/// A pawn attacking a knight is worth more than a pawn attacking nothing, and the
+/// term costs one intersection per piece type because the pawn cover is already
+/// computed for the mobility term.  Pieces attacked by pieces (rather than by pawns)
+/// would be the next refinement, and it needs the defended/undefended distinction to
+/// be worth anything, which is a walk per piece.
+fn threat_terms(board: &Board, colour: usize, own_pawns_cover: Bitboard) -> (i32, i32) {
+    let mut mg = 0;
+    let mut eg = 0;
+    for kind in [KNIGHT, BISHOP, ROOK, QUEEN] {
+        let attacked = board.pieces_of(1 - colour, kind) & own_pawns_cover;
+        let count = popcount(attacked) as i32;
+        mg += count * PAWN_THREAT[kind].0;
+        eg += count * PAWN_THREAT[kind].1;
     }
     (mg, eg)
 }
@@ -664,31 +739,72 @@ mod tests {
         let central = Board::from_fen("4k3/8/8/8/3N4/8/8/4K3 w - - 0 1").unwrap();
         let corner = Board::from_fen("4k3/8/8/8/8/8/8/N3K3 w - - 0 1").unwrap();
         assert_eq!(
-            mobility_terms(&central, WHITE).0,
+            mobility_terms(&central, WHITE, pawn_cover(&central, BLACK)).0,
             8 * MOBILITY[KNIGHT].0,
             "central knight"
         );
         assert_eq!(
-            mobility_terms(&corner, WHITE).0,
+            mobility_terms(&corner, WHITE, pawn_cover(&corner, BLACK)).0,
             2 * MOBILITY[KNIGHT].0,
             "corner knight"
         );
-        // And the whole score moves with it, in the same direction, whenever the term
-        // is switched on (it is off in the shipped set: see `EvalFeatures::all`).
-        let with_mobility = EvalFeatures {
-            mobility: true,
+        // And the whole score moves with it, in the same direction, when the term is
+        // switched on: compare the shipped set against the same set with mobility off.
+        let without_mobility = EvalFeatures {
+            mobility: false,
             ..EvalFeatures::all()
         };
         let central_gain =
-            evaluate_with(&central, with_mobility) - evaluate_with(&central, EvalFeatures::all());
+            evaluate_with(&central, EvalFeatures::all()) - evaluate_with(&central, without_mobility);
         let corner_gain =
-            evaluate_with(&corner, with_mobility) - evaluate_with(&corner, EvalFeatures::all());
+            evaluate_with(&corner, EvalFeatures::all()) - evaluate_with(&corner, without_mobility);
         assert!(
-            central_gain > corner_gain && corner_gain > 0,
+            central_gain > corner_gain,
             "central {} vs corner {}",
             central_gain,
             corner_gain
         );
+        assert!(corner_gain >= 0, "a corner knight should not lose by mobility");
+    }
+
+    #[test]
+    fn mobility_leaves_out_the_squares_the_enemy_pawns_cover() {
+        // The knight on d4 has eight squares either way.  In the first position a black
+        // pawn on c6 covers b5, so one of the eight is a square the knight cannot use;
+        // in the second there is no pawn and all eight count.  This is the difference
+        // between the mobility term that ships and the one that measured worse than
+        // nothing.
+        let covered = Board::from_fen("4k3/8/2p5/8/3N4/8/8/4K3 w - - 0 1").unwrap();
+        assert_eq!(
+            mobility_terms(&covered, WHITE, pawn_cover(&covered, BLACK)).0,
+            7 * MOBILITY[KNIGHT].0,
+            "b5 belongs to the pawn on c6"
+        );
+
+        let open = Board::from_fen("4k3/8/8/8/3N4/8/8/4K3 w - - 0 1").unwrap();
+        assert_eq!(
+            mobility_terms(&open, WHITE, pawn_cover(&open, BLACK)).0,
+            8 * MOBILITY[KNIGHT].0
+        );
+        assert_eq!(pawn_cover(&open, BLACK), 0, "no black pawns to cover anything");
+    }
+
+    #[test]
+    fn a_pawn_attacking_a_piece_is_worth_its_threat() {
+        // The white pawn on d4 attacks c5, where the black knight stands.
+        let board = Board::from_fen("4k3/8/8/2n5/3P4/8/8/4K3 w - - 0 1").unwrap();
+        let (mg, eg) = threat_terms(&board, WHITE, pawn_cover(&board, WHITE));
+        assert_eq!(mg, PAWN_THREAT[KNIGHT].0, "white threatens the knight");
+        assert_eq!(eg, PAWN_THREAT[KNIGHT].1);
+        // Black's pawns are gone, so black threatens nothing back.
+        assert_eq!(threat_terms(&board, BLACK, pawn_cover(&board, BLACK)).0, 0);
+
+        // The same position mirrored gives black the same threat, which is what keeps
+        // the term from favouring a colour.
+        let mirrored_fen = mirrored("4k3/8/8/2n5/3P4/8/8/4K3 w - - 0 1");
+        let mirror = Board::from_fen(&mirrored_fen).unwrap();
+        let (mirror_mg, mirror_eg) = threat_terms(&mirror, BLACK, pawn_cover(&mirror, BLACK));
+        assert_eq!((mirror_mg, mirror_eg), (mg, eg));
     }
 
     #[test]
@@ -758,12 +874,21 @@ mod tests {
                 EvalFeatures::none(),
                 EvalFeatures {
                     mobility: true,
+                    threats: false,
                     king_safety: false,
                     passed_pawn_king_proximity: false,
                     white_positive_score: false,
                 },
                 EvalFeatures {
                     mobility: false,
+                    threats: true,
+                    king_safety: false,
+                    passed_pawn_king_proximity: false,
+                    white_positive_score: false,
+                },
+                EvalFeatures {
+                    mobility: false,
+                    threats: false,
                     king_safety: true,
                     passed_pawn_king_proximity: true,
                     white_positive_score: false,

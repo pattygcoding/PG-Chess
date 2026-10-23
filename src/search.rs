@@ -79,10 +79,11 @@ const LATE_MOVE_PRUNING: [usize; 4] = [0, 8, 20, 40];
 /// first move actually costs something.
 const IID_MINIMUM_DEPTH: i32 = 5;
 
-/// An iteration that cannot finish before the deadline wastes the budget it spends,
-/// because the answer that gets played is the previous depth's.  So a new iteration
-/// is only begun while the search has used less than this share of its time.
-const SOFT_TIME_FRACTION: f64 = 0.55;
+/// An iteration is only started while the budget can absorb this share of it, and the
+/// next iteration is assumed to cost this multiple of the last one.  See the loop in
+/// `search` for why a guess beats a fixed share of the clock.
+const ITERATION_BUDGET_SHARE: f64 = 0.9;
+const ITERATION_GROWTH: f64 = 2.0;
 
 /// Which of the search's strength techniques are switched on.
 ///
@@ -104,17 +105,27 @@ const SOFT_TIME_FRACTION: f64 = 0.55;
 /// | `king_safety` | +114 | |
 /// | `reverse_futility` | +67 | |
 /// | `passed_pawn_king_proximity` | +67 | |
+/// | `mobility` (safe squares only) | +22 | -9 |
+/// | `lmr_refinements` | -22 | +29 |
 /// | `log_reductions` | +23 | +9 |
 /// | `futility` | 0 | -15 |
 /// | `soft_time_limit` | n/a | 0 |
-/// | `mobility` | -20 then -44 | -4 |
+/// | `threats` | 0 | +3 |
+/// | `counter_moves` | -2 | -37 |
 /// | `see_ordering` | -44 | +17 |
 /// | `internal_iterative_deepening` | 0 | -41 |
 /// | `late_move_pruning` | -144, -89 milder | -7 |
 ///
 /// The error bars are around ±20, so the top five are wins, `futility` and the soft
 /// time limit are free (they cost nothing measurable and save nodes or waiting), and
-/// the last four earn nothing: they are the interesting negative results.
+/// the last six earn nothing: they are the interesting negative results.
+///
+/// Rows measured in different configurations are not additive, and the last four were
+/// measured against a configuration that differed from the one that ships.  Re-measured
+/// in the final configuration, safe mobility and the check exception in the reductions
+/// are each worth around ±20 Elo — small enough that a 240-game sample can flip a sign
+/// — which is why the number the README quotes for them is the *pair*: +42 Elo at equal
+/// time over 300 games against the previous release.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SearchFeatures {
     /// Quiescence skips captures that lose material even after the recaptures.
@@ -139,6 +150,10 @@ pub struct SearchFeatures {
     pub internal_iterative_deepening: bool,
     /// Reductions follow the log-of-depth-times-log-of-move curve.
     pub log_reductions: bool,
+    /// The move that refuted the opponent's last move is tried early.
+    pub counter_moves: bool,
+    /// Reductions are adjusted: a move that gives check is not reduced at all.
+    pub lmr_refinements: bool,
     /// Iterations that cannot finish are not started.
     pub soft_time_limit: bool,
     /// Which evaluation terms the search asks for.
@@ -156,6 +171,12 @@ impl SearchFeatures {
             late_move_pruning: false,
             internal_iterative_deepening: false,
             log_reductions: true,
+            // Off: keeping this table measured 2 Elo worse at equal depth and 37 worse
+            // at equal time over 200 games, so it is not a return for the work of
+            // maintaining it.  The likely reason is that the killers and the history
+            // counter already cover the case it is for.
+            counter_moves: false,
+            lmr_refinements: true,
             soft_time_limit: true,
             eval: evaluate::EvalFeatures::all(),
         }
@@ -173,6 +194,8 @@ impl SearchFeatures {
             late_move_pruning: false,
             internal_iterative_deepening: false,
             log_reductions: false,
+            counter_moves: false,
+            lmr_refinements: false,
             soft_time_limit: false,
             eval: evaluate::EvalFeatures::none(),
         }
@@ -323,6 +346,14 @@ pub struct Searcher {
     killers: [[Move; 2]; MAX_PLY],
     /// How often a quiet move has cut a node off, by side, from and to.
     history: [[[i32; 64]; 64]; 2],
+    /// The move that refuted a move reaching (from, to): `counter_moves[from][to]` is
+    /// the quiet move that cut the node off last time the opponent played (from, to).
+    ///
+    /// Keyed by the squares of the move being refuted rather than by the piece that
+    /// made it, because the piece is not knowable here: by the time a node sees the
+    /// opponent's move, its capture may have already replaced the piece on the square
+    /// it landed on.  The squares are exact.
+    counter_moves: [[Move; 64]; 64],
     /// The principal variation as a triangle: `pv_table[ply][0]` is the move
     /// played at `ply`, filled in as the search unwinds.
     pv_table: [[Move; MAX_PLY]; MAX_PLY],
@@ -351,6 +382,7 @@ impl Searcher {
             tt: TranspositionTable::new(tt_megabytes),
             killers: [[0; 2]; MAX_PLY],
             history: [[[0; 64]; 64]; 2],
+            counter_moves: [[0; 64]; 64],
             pv_table: [[0; MAX_PLY]; MAX_PLY],
             pv_length: [0; MAX_PLY],
             root_moves: MoveList::new(),
@@ -390,6 +422,7 @@ impl Searcher {
     pub fn reset_heuristics(&mut self) {
         self.killers = [[0; 2]; MAX_PLY];
         self.history = [[[0; 64]; 64]; 2];
+        self.counter_moves = [[0; 64]; 64];
         self.tt.clear();
     }
 
@@ -427,19 +460,26 @@ impl Searcher {
 
         self.root_scores = [0; MAX_MOVES];
         let mut result = SearchResult::empty();
+        let mut last_iteration_ms = 0.0;
 
         for depth in 1..=limits.max_depth {
-            // An iteration takes longer than the one before it, so once most of the
-            // budget is gone the next one is likely to be cut off, and a cut-off
-            // iteration changes nothing about the answer.  Better to have spent the
-            // time finishing the depth in hand.
-            if self.features.soft_time_limit
-                && depth > 1
-                && now_ms() - self.start_ms > limits.time_ms as f64 * SOFT_TIME_FRACTION
-            {
-                break;
+            // Whether to start another iteration at all is a bet on it finishing: a
+            // cut-off iteration changes nothing about the answer, so its time is spent
+            // for nothing.  The guess is the previous iteration's duration doubled,
+            // because a search that just finished depth d in t milliseconds is roughly
+            // as likely to spend 2t on depth d+1 — a better guess than a fixed share of
+            // the clock, which either wastes the tail of the budget or gives up on an
+            // iteration that would have fit.
+            if self.features.soft_time_limit && depth > 1 {
+                let elapsed = now_ms() - self.start_ms;
+                let expected = (last_iteration_ms * ITERATION_GROWTH).max(1.0);
+                if elapsed + expected > limits.time_ms as f64 * ITERATION_BUDGET_SHARE {
+                    break;
+                }
             }
+            let iteration_started = now_ms();
             let score = self.search_root(board, depth, result.score);
+            last_iteration_ms = now_ms() - iteration_started;
             if self.stopped {
                 break;
             }
@@ -705,6 +745,17 @@ impl Searcher {
                 return 600_000;
             }
         }
+        // The move that refuted the opponent's last one is a better guess than the
+        // history counter, because it is about this position rather than this ply.
+        if self.features.counter_moves {
+            if let Some(previous) = board.last_move() {
+                let refutation =
+                    self.counter_moves[moves::from_square(previous)][moves::to_square(previous)];
+                if refutation != 0 && refutation == mv {
+                    return 550_000;
+                }
+            }
+        }
         self.history[board.side_to_move()][from][to]
     }
 
@@ -919,11 +970,22 @@ impl Searcher {
                 // is unlikely to be best, so it gets a shallower look first and is
                 // re-searched at full depth only when that look beats alpha.
                 let reduction = if quiet && depth >= 3 && legal >= 3 {
-                    if self.features.log_reductions {
+                    let mut base = if self.features.log_reductions {
                         self.reductions[(depth.min(63)) as usize][legal.min(63)]
                     } else {
                         1 + i32::from(legal >= 8)
+                    };
+                    if self.features.lmr_refinements && board.in_check() {
+                        // A move that gives check is not a late move: the opponent has
+                        // to answer it, and the search is about to extend the child by a
+                        // ply for exactly that reason, so reducing here would cancel the
+                        // extension out.  (An earlier version also reduced one ply more
+                        // off the principal variation, and that measured 42 Elo *worse*
+                        // at equal depth: the log curve is already steep enough that
+                        // adding to it prunes real moves.)
+                        base = 0;
                     }
+                    base
                 } else {
                     0
                 };
@@ -982,6 +1044,16 @@ impl Searcher {
                             self.killers[ply][0] = mv;
                         }
                         self.history[side_to_move][from][to] += depth * depth;
+                        // The same move is often the answer to the opponent's last one
+                        // wherever it is played, so remember it against those squares.
+                        // The board is back to this node's position here, which is what
+                        // makes `last_move` the opponent's move.
+                        if self.features.counter_moves {
+                            if let Some(previous) = board.last_move() {
+                                self.counter_moves[moves::from_square(previous)]
+                                    [moves::to_square(previous)] = mv;
+                            }
+                        }
                     }
                     break;
                 }
@@ -1579,6 +1651,106 @@ mod tests {
             }
         }
         assert!(offered >= 1, "no move was offered at all");
+    }
+
+    #[test]
+    fn a_quiet_refutation_is_remembered_as_a_counter_move() {
+        // Kiwipete at six ply is deep enough to refute quiet moves, so with the flag on
+        // the table has to come out of the search holding something — and stay empty
+        // with it off, which is the shipped default and what makes the match between the
+        // two mean anything.
+        let kiwipete = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1";
+        let stored_after = |features: SearchFeatures| {
+            let mut board = Board::from_fen(kiwipete).unwrap();
+            let mut searcher = Searcher::new(4);
+            searcher.set_features(features);
+            searcher.search(&mut board, SearchLimits::new(6, 10_000, 2));
+            searcher
+                .counter_moves
+                .iter()
+                .flatten()
+                .filter(|mv| **mv != 0)
+                .count()
+        };
+
+        assert!(
+            stored_after(SearchFeatures {
+                counter_moves: true,
+                ..SearchFeatures::all()
+            }) > 0,
+            "the search stored no counter-move at all"
+        );
+        assert_eq!(
+            stored_after(SearchFeatures::all()),
+            0,
+            "the shipped default stores counter-moves, which the matches say it should not"
+        );
+    }
+
+    #[test]
+    fn the_counter_move_is_ordered_ahead_of_an_ordinary_quiet_move() {
+        // Pretend the opponent has just played e2e4 and the refutation is d7d5.  With
+        // the flag on the ordering has to prefer the stored refutation; with it off —
+        // the shipped default — the table is not consulted at all.
+        let mut board = Board::startpos();
+        let opponent_move = moves::from_uci("e2e4").unwrap();
+        assert!(board.make_move(opponent_move));
+        let refutation = moves::from_uci("d7d5").unwrap();
+        let ordinary = moves::from_uci("d7d6").unwrap();
+        let key = (
+            moves::from_square(opponent_move),
+            moves::to_square(opponent_move),
+        );
+
+        let mut searcher = Searcher::new(1);
+        searcher.set_features(SearchFeatures {
+            counter_moves: true,
+            ..SearchFeatures::all()
+        });
+        searcher.counter_moves[key.0][key.1] = refutation;
+        let preferred = searcher.move_score(&board, refutation, 0, 1, false);
+        let other = searcher.move_score(&board, ordinary, 0, 1, false);
+        assert_eq!(preferred, 550_000);
+        assert!(
+            preferred > other,
+            "counter-move scored {} against {}",
+            preferred,
+            other
+        );
+
+        let searcher = Searcher::new(1);
+        assert!(!searcher.features().counter_moves, "the default is off");
+        let mut searcher = searcher;
+        searcher.counter_moves[key.0][key.1] = refutation;
+        assert_eq!(
+            searcher.move_score(&board, refutation, 0, 1, false),
+            0,
+            "the flag is off and the move was still preferred"
+        );
+    }
+
+    #[test]
+    fn the_search_uses_most_of_the_budget_it_is_given() {
+        // A position that cannot be finished inside the budget by any margin, so the
+        // engine has to keep starting iterations rather than stopping at the first one
+        // that happens to fit.  A budget that is quietly ignored is as much of a bug as
+        // one that is overrun.
+        let mut board = Board::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .unwrap();
+        let mut searcher = Searcher::new(16);
+        let result = searcher.search(&mut board, SearchLimits::new(20, 300, 2));
+        assert!(
+            result.time_ms >= 100,
+            "gave up after {} ms of a 300 ms budget",
+            result.time_ms
+        );
+        assert!(
+            result.time_ms <= 300,
+            "overran the budget: {} ms",
+            result.time_ms
+        );
     }
 
     #[test]

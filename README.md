@@ -6,8 +6,10 @@ JavaScript front end that runs the whole search in a Web Worker.
 The engine uses 64-bit bitboards, iterative deepening negamax with alpha-beta
 pruning and fail-soft bounds, aspiration windows, a 32 MB transposition table,
 MVV-LVA ordering backed by killer and history heuristics, static exchange
-evaluation, reverse futility and a quiescence search at the leaves.  It targets club
-strength and reaches ten ply well inside a second in a browser tab.
+evaluation, reverse futility and a quiescence search at the leaves.  The evaluation
+is PeSTO's tables plus mobility over the squares enemy pawns do not cover, king
+safety and pawn structure.  It targets club strength and reaches ten ply well inside
+a second in a browser tab.
 
 * Live on the arcade: **<https://arcade.pattygcoding.com/chess>**
 * The JavaScript interface is one `Engine` class; the page never sees a bitboard.
@@ -25,10 +27,10 @@ without a browser.
 | perft(5) from the start position, 4,865,609 nodes | 0.15 s | 0.21 s |
 | perft(4) from Kiwipete, 4,085,603 nodes | 0.12 s | — |
 | Move generation rate | ~33 Mnodes/s | ~23 Mnodes/s |
-| Search rate | ~1.5–2.4 Mnodes/s | ~1.4–2.0 Mnodes/s |
+| Search rate | ~1.5–2.4 Mnodes/s | ~1.3–1.6 Mnodes/s |
 | Club level (0.7 s, 10 ply cap): depth reached | 10, in ~0.2 s | 10, in ~0.3 s |
-| Strong level (1.5 s, 14 ply cap): Kiwipete | 13, in 1.2 s | 12, in 0.95 s |
-| Compiled module | — | 108 KB `.wasm` + 20 KB glue |
+| Strong level (1.5 s, 14 ply cap): Kiwipete | 12, in 0.9 s | 12, in 1.3 s |
+| Compiled module | — | 109 KB `.wasm` + 20 KB glue |
 
 Both levels finish inside their budget and are then held back by their depth caps, so
 the caps — not the clock — are what makes a level's turn take the time it takes.
@@ -41,8 +43,8 @@ Two hundred games at equal time against the engine as it was first released:
 
 | Comparison | Result |
 | --- | --- |
-| Everything on vs the released engine (equal time, 300 games) | **+200 Elo** (+170 to +231) |
-| Everything on vs the released engine (equal depth 8, 200 games) | +91 Elo (+56 to +125) |
+| Everything on vs the released engine (equal time, 300 games) | **+227 Elo** (+192 to +261) |
+| The second round vs the first (equal time, 300 games) | **+42 Elo** (+20 to +64) |
 | Everything on vs the same search without the new techniques (equal depth 6, 300 games) | +64 Elo (+43 to +86) |
 | Everything on vs the same engine with the score read from white (equal time, 60 games) | won every game |
 | Identical engines against each other (the control) | 50% of the points |
@@ -73,22 +75,31 @@ The error bars are around ±20 Elo, so this is what the set is worth:
 | Static exchange evaluation in quiescence | +137 | | yes |
 | Aspiration windows | +134 | | yes |
 | King safety (attackers on the king's ring) | +114 | | yes |
+| Safe mobility (squares enemy pawns do not cover) | +22 | -9 | yes |
+| Not reducing a move that gives check | -22 | +29 | yes |
 | Reverse futility | +67 | | yes |
 | King proximity to a passed pawn | +67 | | yes |
 | Log-shaped late move reductions | +23 | +9 | yes |
 | Futility | 0 | -15 | yes: it saves nodes for nothing |
 | Soft time limit | — | 0 | yes: it saves the user's time for nothing |
-| Mobility | -20, -44 | -4 | no |
+| Pawn threats | 0 | +3 | no |
+| Counter-move heuristic | -2 | -37 | no |
 | Exchange-value capture ordering | -44 | +17 | no |
 | Internal iterative deepening | 0 | -41 | no |
 | Late move pruning | -144, -89 | -7 | no |
 
-The negative results are the point of the exercise.  Late move pruning and internal
-iterative deepening are both standard, both measured *worse*, and both are off by
-default with the flag and the measurement left in place.  Mobility is off for the
-same reason: counted this way it cost more than it paid, and the next thing to try is
-the usual refinement — counting only the squares the enemy's pawns do not cover —
-rather than more weight.
+The negative results are the point of the exercise.  Late move pruning, internal
+iterative deepening and the counter-move heuristic are all standard, all measured
+*worse*, and all off by default with the flag and the measurement left in place.
+
+Two things that table taught me, both worth more than the Elo.  **A term can flip
+sign when it is done properly**: mobility measured -44 counting every square a piece
+attacks and +22 counting only the squares enemy pawns do not cover, which is the same
+weights over a different area.  And **the rows are not additive, and a small effect
+cannot be separated from noise by a small match**: safe mobility and the check
+exception each measure around ±20 Elo, which 240 games can flip, so the number quoted
+for them is the pair (+42 at equal time against the previous release) rather than the
+sum of two wobbly parts.
 
 ## How it works
 
@@ -232,8 +243,11 @@ move with a full window and holds the band to what it says.
   which is fine at this strength but is the cheapest available strength gain.
 * The matches are the engine against itself at short time controls, which measures
   the *differences* between configurations well and absolute strength not at all.
-* The evaluation has no mobility term (it did not pay for itself) and no threats,
-  safe squares or rook-lift ideas; the pawn structure terms are the textbook three.
+* The evaluation's threats term is off (it measured nothing), and the pawn structure
+  terms are still the textbook three: doubled, isolated and passed.  Backward and
+  connected pawns, rook-behind-the-passer and a real draw scale factor (opposite
+  coloured bishops, a wrong-coloured bishop with a rook pawn) are the next terms
+  worth trying, in that order of confidence.
 
 ## License
 

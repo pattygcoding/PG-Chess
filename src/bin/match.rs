@@ -74,6 +74,10 @@ enum Opponent {
     /// Every technique on: the control, and the base for `--without`, which turns
     /// this mode into "the same engine minus one technique".
     Everything,
+    /// The engine as the previous release shipped: this round's techniques all off,
+    /// including the mobility term that is on in `all()`.  This is the comparison that
+    /// says what this round of work was worth.
+    Previous,
 }
 
 impl Opponent {
@@ -92,6 +96,14 @@ impl Opponent {
                 ..SearchFeatures::all()
             },
             Opponent::Everything => SearchFeatures::all(),
+            Opponent::Previous => SearchFeatures {
+                lmr_refinements: false,
+                eval: evaluate::EvalFeatures {
+                    mobility: false,
+                    ..evaluate::EvalFeatures::all()
+                },
+                ..SearchFeatures::all()
+            },
         }
     }
 
@@ -101,6 +113,7 @@ impl Opponent {
             Opponent::Features => "the same search without the new techniques",
             Opponent::Orientation => "the same engine with the score read from white",
             Opponent::Everything => "the same engine, every technique on",
+            Opponent::Previous => "the previous release",
         }
     }
 }
@@ -135,8 +148,11 @@ impl Options {
                 "late_move_pruning" => features.late_move_pruning = false,
                 "internal_iterative_deepening" => features.internal_iterative_deepening = false,
                 "log_reductions" => features.log_reductions = false,
+                "counter_moves" => features.counter_moves = false,
+                "lmr_refinements" => features.lmr_refinements = false,
                 "soft_time_limit" => features.soft_time_limit = false,
                 "mobility" => features.eval.mobility = false,
+                "threats" => features.eval.threats = false,
                 "king_safety" => features.eval.king_safety = false,
                 "passed_pawn_king_proximity" => features.eval.passed_pawn_king_proximity = false,
                 other => panic!("--without does not know {}", other),
@@ -198,8 +214,9 @@ impl Options {
                         Some("features") => Opponent::Features,
                         Some("orientation") => Opponent::Orientation,
                         Some("full") => Opponent::Everything,
+                        Some("previous") => Opponent::Previous,
                         other => panic!(
-                            "--old takes shipped, features, orientation or full, not {:?}",
+                            "--old takes shipped, features, orientation, full or previous, not {:?}",
                             other
                         ),
                     };
