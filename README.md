@@ -9,8 +9,17 @@ MVV-LVA ordering backed by killer and history heuristics, static exchange
 evaluation, reverse futility and a quiescence search at the leaves.  The evaluation
 is PeSTO's tables plus mobility over the squares enemy pawns do not cover, king
 safety and pawn structure.  It targets club strength, and the clock — not a depth cap
-— is what decides how deep it looks: eleven ply inside a seven-tenths-of-a-second
-move in a browser tab, nineteen in a simple endgame.
+— is what decides how deep it looks: eleven ply inside a seven-tenths-of-a-second move
+in a browser tab, nineteen in a simple endgame.
+
+"The module" and "a browser tab" are two different numbers at the Club budget, and the
+difference is worth one line: the number above is the module's own iterative deepening,
+which is what the Wasm column below measures, while the page's worker asks for one
+depth at a time so it can draw a progress line.  Each of those calls re-walks the
+shallower depths and converts a principal variation to SAN, so the worker lands one ply
+lower at seven-tenths of a second (ten, measured live in the page).  Freeing the page
+of that last ply means giving up the progress line or making the worker's calls
+cheaper, and neither is worth a ply yet.
 
 * Live on the arcade: **<https://arcade.pattygcoding.com/chess>**
 * The JavaScript interface is one `Engine` class; the page never sees a bitboard.
