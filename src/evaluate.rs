@@ -80,6 +80,20 @@ pub const KING_ATTACK_WEIGHT: [i32; 6] = [0, 2, 3, 4, 6, 0];
 /// for the escorting king (a bonus) and the defending king (a penalty).
 const PASSED_PAWN_KING_STEP: i32 = 5;
 
+/// What a pawn defending another pawn is worth (mg, eg): a chain cannot be undermined
+/// by a single attacker, which is what the piece-square tables cannot see.
+const CONNECTED_PAWN: (i32, i32) = (8, 12);
+
+/// How many king-attack units one enemy pawn storming towards the king is worth.  A
+/// pawn arriving in front of a castled king is worth more than the pawn that made it.
+const KING_STORM_UNIT: i32 = 4;
+
+/// What the score is multiplied by in a position that is drawn by its nature, out of
+/// `SCALE_ONE`.
+pub const SCALE_ONE: i32 = 32;
+const SCALE_DRAWN_BISHOPS: i32 = 16;
+const SCALE_DRAWN_MINOR: i32 = 8;
+
 const MG_PAWN_TABLE: [i32; 64] = [
     0, 0, 0, 0, 0, 0, 0, 0, //
     98, 134, 61, 95, 68, 126, 34, -11, //
@@ -246,6 +260,14 @@ pub struct EvalFeatures {
     pub mobility: bool,
     /// Enemy pieces this side's pawns are attacking.
     pub threats: bool,
+    /// Pawns defended by other pawns.
+    pub connected_pawns: bool,
+    /// Enemy pawns advancing towards this side's king.
+    pub king_storm: bool,
+    /// Scale the score towards zero in positions that are drawn however much material
+    /// one side is up: opposite-coloured bishops, a lone minor piece with no pawns,
+    /// and a rook pawn with the wrong bishop.
+    pub drawish_endings: bool,
     /// How many enemy pieces are bearing down on the king's neighbourhood.
     pub king_safety: bool,
     /// How close each side's king is to the passed pawn it is escorting or chasing.
@@ -278,6 +300,19 @@ impl EvalFeatures {
             // The refinement worth trying is threats from *pieces* as well as pawns,
             // which needs the defended/undefended distinction to mean anything.
             threats: false,
+            // Off: pawns defending pawns measured nothing at equal depth over 240 games,
+            // which is not a return for the work at every leaf.
+            connected_pawns: false,
+            // Off: +44 Elo at *equal depth*, and −46 with its companion term at equal
+            // time, over 200 to 300 games each way.  The two are not a contradiction:
+            // a positional term makes the static score a worse predictor of the search's
+            // own answer, and every pruning decision in the search — reverse futility,
+            // futility, ProbCut, delta pruning — leans on that prediction.  Worth
+            // knowing: this is the first time a term measured positive per depth and
+            // still lost Elo per second.  The tests keep the code honest so a later
+            // round can retry it with a better-behaved static score.
+            king_storm: false,
+            drawish_endings: false,
             king_safety: true,
             passed_pawn_king_proximity: true,
             white_positive_score: false,
@@ -288,6 +323,9 @@ impl EvalFeatures {
         EvalFeatures {
             mobility: false,
             threats: false,
+            connected_pawns: false,
+            king_storm: false,
+            drawish_endings: false,
             king_safety: false,
             passed_pawn_king_proximity: false,
             white_positive_score: false,
@@ -300,6 +338,9 @@ impl EvalFeatures {
         EvalFeatures {
             mobility: false,
             threats: false,
+            connected_pawns: false,
+            king_storm: false,
+            drawish_endings: false,
             king_safety: false,
             passed_pawn_king_proximity: false,
             white_positive_score: true,
@@ -311,6 +352,73 @@ impl Default for EvalFeatures {
     fn default() -> Self {
         EvalFeatures::all()
     }
+}
+
+/// How much of the score a position is worth, out of `SCALE_ONE`, when material says
+/// one side is up and the position says nobody is winning.
+///
+/// Two rules, both of them cases where the draw follows from the *material alone* plus
+/// the square colours, which is what makes them safe to encode statically:
+///
+/// * one bishop each, on opposite colours, with no knights or majors and the same
+///   number of pawns: the defender blocks on the squares the attacking bishop cannot
+///   reach, and half a score is the most the position can be worth.
+/// * at most one minor piece each with no pawns at all: none of those combinations can
+///   force mate, whatever the pieces are, and `is_insufficient_material` only catches
+///   the ones where it is provable (two knights cannot, but they *can* be mated).
+///
+/// The textbook third case — a rook pawn with a bishop that cannot cover the promotion
+/// square — is deliberately *not* here.  It is a draw only when the defending king can
+/// reach the corner region, which is a question about the position rather than about
+/// the material, and encoding it as a dead draw would throw away won positions where
+/// the defender's king is cut off.
+fn drawishness_scale(board: &Board) -> i32 {
+    let pawns_white = popcount(board.pieces_of(WHITE, PAWN));
+    let pawns_black = popcount(board.pieces_of(BLACK, PAWN));
+    let minors_white = board.pieces_of(WHITE, KNIGHT) | board.pieces_of(WHITE, BISHOP);
+    let minors_black = board.pieces_of(BLACK, KNIGHT) | board.pieces_of(BLACK, BISHOP);
+    let knights = board.pieces_of(WHITE, KNIGHT) | board.pieces_of(BLACK, KNIGHT);
+    let majors = board.pieces_of(WHITE, ROOK)
+        | board.pieces_of(BLACK, ROOK)
+        | board.pieces_of(WHITE, QUEEN)
+        | board.pieces_of(BLACK, QUEEN);
+
+    if pawns_white == 0
+        && pawns_black == 0
+        && majors == 0
+        && (minors_white | minors_black) != 0
+        && popcount(minors_white) <= 1
+        && popcount(minors_black) <= 1
+    {
+        return SCALE_DRAWN_MINOR;
+    }
+
+    if pawns_white == pawns_black && knights == 0 && majors == 0 {
+        if let (Some(white), Some(black)) = (
+            single_square(board.pieces_of(WHITE, BISHOP)),
+            single_square(board.pieces_of(BLACK, BISHOP)),
+        ) {
+            if square_colour(white) != square_colour(black) {
+                return SCALE_DRAWN_BISHOPS;
+            }
+        }
+    }
+
+    SCALE_ONE
+}
+
+/// The one square in a set, or `None` if it does not hold exactly one.
+fn single_square(bits: Bitboard) -> Option<usize> {
+    if popcount(bits) == 1 {
+        Some(crate::bitboard::lsb(bits))
+    } else {
+        None
+    }
+}
+
+/// Which colour complex a square belongs to: 0 for the dark squares, 1 for the light.
+fn square_colour(square: usize) -> usize {
+    (crate::bitboard::file_of(square) + crate::bitboard::rank_of(square)) & 1
 }
 
 /// The static score of the position, in centipawns, from the side to move's point
@@ -370,8 +478,16 @@ pub fn evaluate_with(board: &Board, features: EvalFeatures) -> i32 {
             mg[colour] += threat_mg;
             eg[colour] += threat_eg;
         }
+        if features.connected_pawns {
+            // A pawn standing on a square another of our pawns attacks is defended, so
+            // taking it costs material.  The cover is already computed for the terms
+            // above.
+            let defended = popcount(board.pieces_of(colour, PAWN) & our_cover) as i32;
+            mg[colour] += defended * CONNECTED_PAWN.0;
+            eg[colour] += defended * CONNECTED_PAWN.1;
+        }
         if features.king_safety {
-            mg[colour] -= king_danger(board, colour);
+            mg[colour] -= king_danger(board, colour, features.king_storm);
         }
     }
 
@@ -392,6 +508,14 @@ pub fn evaluate_with(board: &Board, features: EvalFeatures) -> i32 {
     // PeSTO's taper: the middlegame reading holds while the board is full and
     // gives way linearly as material leaves it.
     let score = (midgame * phase + endgame * (MAX_PHASE - phase)) / MAX_PHASE;
+    // Positions that are drawn however much material one side is up are worth less
+    // than their material: without this the search plays into them believing it is
+    // winning and, from the other side, defends them as though they were lost.
+    let score = if features.drawish_endings {
+        score * drawishness_scale(board) / SCALE_ONE
+    } else {
+        score
+    };
     // Having the move is worth something, and it is worth it to the side that has it.
     // The first release instead signed the bonus with white, which is the same
     // mistake as the positional part and is kept alive only by the flag.
@@ -478,7 +602,7 @@ fn threat_terms(board: &Board, colour: usize, own_pawns_cover: Bitboard) -> (i32
 /// attackers are more than twice as dangerous as one.  This is the classic shape of
 /// the term, and it is what stops the engine from leaving its king in a position
 /// where a sacrifice opens it up.
-fn king_danger(board: &Board, colour: usize) -> i32 {
+fn king_danger(board: &Board, colour: usize, count_storm: bool) -> i32 {
     let king = board.king_square(colour);
     let ring = king_attacks(king) | square_bb(king);
     let occupied = board.occupied();
@@ -493,7 +617,40 @@ fn king_danger(board: &Board, colour: usize) -> i32 {
             }
         }
     }
+
+    if count_storm {
+        units += king_storm_units(board, colour);
+    }
     units * units / 4
+}
+
+/// Enemy pawns on their way to this side's king, as king-attack units.
+///
+/// A pawn two files from the king and past the middle of the board is a threat the
+/// piece count cannot see: the ring around the king is where it is going to arrive,
+/// and the squares it covers are squares the king's defenders cannot use.  Only the
+/// three files around the king are counted, and only from the half of the board the
+/// pawn came from.
+fn king_storm_units(board: &Board, colour: usize) -> i32 {
+    let king_file = crate::bitboard::file_of(board.king_square(colour));
+    let mut files = FILE_MASKS[king_file];
+    if king_file > 0 {
+        files |= FILE_MASKS[king_file - 1];
+    }
+    if king_file < 7 {
+        files |= FILE_MASKS[king_file + 1];
+    }
+
+    // For a white king the enemy pawns worth counting are the ones already on ranks
+    // five to eight; for a black king, ranks one to four.
+    let far_half = if colour == WHITE {
+        crate::bitboard::RANK_5 | crate::bitboard::RANK_6 | crate::bitboard::RANK_7 | crate::bitboard::RANK_8
+    } else {
+        crate::bitboard::RANK_1 | crate::bitboard::RANK_2 | crate::bitboard::RANK_3 | crate::bitboard::RANK_4
+    };
+
+    let storming = board.pieces_of(1 - colour, PAWN) & files & far_half;
+    popcount(storming) as i32 * KING_STORM_UNIT
 }
 
 /// The attack set of one piece, which is a table lookup for the leapers and a ray
@@ -810,24 +967,106 @@ mod tests {
     #[test]
     fn king_safety_is_zero_until_something_attacks_the_king() {
         let quiet = Board::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
-        assert_eq!(king_danger(&quiet, WHITE), 0);
-        assert_eq!(king_danger(&quiet, BLACK), 0);
+        assert_eq!(king_danger(&quiet, WHITE, true), 0);
+        assert_eq!(king_danger(&quiet, BLACK, true), 0);
 
         // A queen on e2 stands on the white king's ring and hits five squares of it.
         let watched = Board::from_fen("4k3/8/8/8/8/8/4q3/4K3 w - - 0 1").unwrap();
         let units = KING_ATTACK_WEIGHT[QUEEN];
-        assert_eq!(king_danger(&watched, WHITE), units * units / 4);
+        assert_eq!(king_danger(&watched, WHITE, true), units * units / 4);
         // The white king on e1 is nowhere near the black king on e8.
-        assert_eq!(king_danger(&watched, BLACK), 0);
+        assert_eq!(king_danger(&watched, BLACK, true), 0);
 
         // Two attackers are more than twice as bad as one: the term is quadratic.
         let doubled = Board::from_fen("4k3/8/8/8/8/8/3qq3/4K3 w - - 0 1").unwrap();
         assert!(
-            king_danger(&doubled, WHITE) > 2 * king_danger(&watched, WHITE),
+            king_danger(&doubled, WHITE, true) > 2 * king_danger(&watched, WHITE, true),
             "one attacker {} vs two {}",
-            king_danger(&watched, WHITE),
-            king_danger(&doubled, WHITE)
+            king_danger(&watched, WHITE, true),
+            king_danger(&doubled, WHITE, true)
         );
+    }
+
+    #[test]
+    fn enemy_pawns_marching_at_the_king_are_dangerous() {
+        // A black pawn on f6 is two files from the white king on g1 and past the middle
+        // of the board: that is the pawn the storm term counts.
+        let near = Board::from_fen("4k3/8/5p2/8/8/8/8/6K1 w - - 0 1").unwrap();
+        assert_eq!(king_storm_units(&near, WHITE), KING_STORM_UNIT);
+
+        // The same pawn still on its own half has not arrived yet.
+        let far = Board::from_fen("4k3/8/8/8/5p2/8/8/6K1 w - - 0 1").unwrap();
+        assert_eq!(king_storm_units(&far, WHITE), 0, "f4 has not crossed the middle");
+
+        // A pawn on the other side of the board is not a threat to this king at all,
+        // even though it is far advanced.
+        let elsewhere = Board::from_fen("4k3/p7/8/8/8/8/8/6K1 w - - 0 1").unwrap();
+        assert_eq!(king_storm_units(&elsewhere, WHITE), 0);
+
+        // And the term is symmetric: the mirror position counts the same pawn for a
+        // black king.
+        let black_king = Board::from_fen("6k1/8/8/8/5P2/8/8/4K3 b - - 0 1").unwrap();
+        assert_eq!(king_storm_units(&black_king, BLACK), KING_STORM_UNIT);
+        assert_eq!(king_storm_units(&black_king, WHITE), 0, "it is white's pawn");
+    }
+
+    #[test]
+    fn connected_pawns_are_worth_more_than_scattered_ones() {
+        // Three white pawns either in a chain (defending each other) or spread out with
+        // nothing defending anything.
+        let connected = Board::from_fen("4k3/8/8/8/3P4/4P3/8/4K3 w - - 0 1").unwrap();
+        let scattered = Board::from_fen("4k3/8/8/8/3P4/8/2P5/4K3 w - - 0 1").unwrap();
+        let defended = |board: &Board| popcount(board.pieces_of(WHITE, PAWN) & pawn_cover(board, WHITE));
+        assert_eq!(defended(&connected), 1, "e3 is defended by d4");
+        assert_eq!(defended(&scattered), 0, "nothing defends anything");
+    }
+
+    #[test]
+    fn a_drawn_ending_is_not_worth_its_material() {
+        // Two pawns each and bishops on opposite colours: material says level, and the
+        // position says nobody is winning either way.
+        let opposite = Board::from_fen("8/5k2/3p4/8/2P5/1B6/5K2/6b1 w - - 0 1").unwrap();
+        assert_eq!(
+            square_colour(crate::bitboard::parse_square("b3").unwrap()),
+            1,
+            "b3 is a light square"
+        );
+        assert_eq!(drawishness_scale(&opposite), SCALE_DRAWN_BISHOPS);
+
+        // The same position with the black bishop on a dark square is a normal game.
+        let same = Board::from_fen("8/5k2/3p4/8/8/1B6/2P2K2/8 w - - 0 1").unwrap();
+        assert_eq!(drawishness_scale(&same), SCALE_ONE, "only one bishop");
+
+        // A knight each and no pawns anywhere: drawn whatever the pieces are.
+        let minors = Board::from_fen("8/5k2/8/8/8/1N6/5K2/6n1 w - - 0 1").unwrap();
+        assert_eq!(drawishness_scale(&minors), SCALE_DRAWN_MINOR);
+
+        // A rook up with no pawns is *not* a drawn ending: material that can mate.
+        let rook = Board::from_fen("8/5k2/8/8/8/R7/5K2/8 w - - 0 1").unwrap();
+        assert_eq!(drawishness_scale(&rook), SCALE_ONE);
+    }
+
+    #[test]
+    fn the_scale_only_ever_shrinks_a_score() {
+        // A half-scaled score must stay on the same side of zero, or the scaling would
+        // turn a winning position into a losing one.
+        for fen in [
+            "8/5k2/3p4/8/2P5/1B6/5K2/6b1 w - - 0 1",
+            "8/5k2/8/8/8/1N6/5K2/6n1 w - - 0 1",
+            "4k3/8/8/8/8/8/8/4K3 w - - 0 1",
+        ] {
+            let board = Board::from_fen(fen).unwrap();
+            let scaled = evaluate_with(&board, EvalFeatures::all());
+            let unscaled = evaluate_with(
+                &board,
+                EvalFeatures {
+                    drawish_endings: false,
+                    ..EvalFeatures::all()
+                },
+            );
+            assert!(scaled.abs() <= unscaled.abs() + TEMPO, "{}: {} against {}", fen, scaled, unscaled);
+            assert!(scaled.signum() == unscaled.signum() || scaled.abs() <= TEMPO);
+        }
     }
 
     #[test]
@@ -874,24 +1113,29 @@ mod tests {
                 EvalFeatures::none(),
                 EvalFeatures {
                     mobility: true,
-                    threats: false,
-                    king_safety: false,
-                    passed_pawn_king_proximity: false,
-                    white_positive_score: false,
+                    ..EvalFeatures::none()
                 },
                 EvalFeatures {
-                    mobility: false,
                     threats: true,
-                    king_safety: false,
-                    passed_pawn_king_proximity: false,
-                    white_positive_score: false,
+                    ..EvalFeatures::none()
                 },
                 EvalFeatures {
-                    mobility: false,
-                    threats: false,
+                    connected_pawns: true,
+                    ..EvalFeatures::none()
+                },
+                EvalFeatures {
+                    king_storm: true,
+                    king_safety: true,
+                    ..EvalFeatures::none()
+                },
+                EvalFeatures {
+                    drawish_endings: true,
+                    ..EvalFeatures::none()
+                },
+                EvalFeatures {
                     king_safety: true,
                     passed_pawn_king_proximity: true,
-                    white_positive_score: false,
+                    ..EvalFeatures::none()
                 },
             ] {
                 // The mirrored position hands the move to the other side, so both

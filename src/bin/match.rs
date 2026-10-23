@@ -75,8 +75,14 @@ enum Opponent {
     /// this mode into "the same engine minus one technique".
     Everything,
     /// The engine as the previous release shipped: this round's techniques all off,
-    /// including the mobility term that is on in `all()`.  This is the comparison that
-    /// says what this round of work was worth.
+    /// including the mobility term that is on in `all()`.
+    ///
+    /// Round four's default configuration is now this one plus the time management, so
+    /// against `all()` this opponent is the *control* — it exists to say that the round's
+    /// techniques changed nothing.  The time management is the one change a match cannot
+    /// price from the inside: the depth caps and the iteration predictor are properties
+    /// of the binary, not of the searcher, so both sides of a match always share them.
+    /// `--old-depth` is how the cap half of it is measured instead.
     Previous,
 }
 
@@ -97,9 +103,11 @@ impl Opponent {
             },
             Opponent::Everything => SearchFeatures::all(),
             Opponent::Previous => SearchFeatures {
-                lmr_refinements: false,
+                probcut: false,
                 eval: evaluate::EvalFeatures {
-                    mobility: false,
+                    king_storm: false,
+                    connected_pawns: false,
+                    drawish_endings: false,
                     ..evaluate::EvalFeatures::all()
                 },
                 ..SearchFeatures::all()
@@ -125,6 +133,10 @@ struct Options {
     /// takes", which makes a match reproducible move for move.
     time_ms: u64,
     depth: i32,
+    /// The depth cap for the opponent only.  Zero means "the level's own cap", which is
+    /// what the shipped side always uses; a number here caps the opponent lower, so the
+    /// match can price a change that lets the engine search deeper within the same time.
+    old_depth: i32,
     threads: usize,
     verbose: bool,
     opponent: Opponent,
@@ -132,35 +144,56 @@ struct Options {
     /// implies, which is how one technique is measured on its own: the opponent is
     /// the whole engine minus that flag, so the match says what it is worth.
     without: Vec<String>,
+    /// Flags to *set* on the opponent's side, which is how a technique that ships off
+    /// is measured: the opponent is the whole engine plus that flag.
+    with: Vec<String>,
 }
 
 impl Options {
-    /// The opponent's feature set: its mode, minus anything named with `--without`.
+    /// The opponent's feature set: its mode, plus anything named with `--with`, minus
+    /// anything named with `--without`.
     fn opponent_features(&self) -> SearchFeatures {
         let mut features = self.opponent.features();
         for name in &self.without {
-            match name.as_str() {
-                "see_pruning" => features.see_pruning = false,
-                "see_ordering" => features.see_ordering = false,
-                "aspiration" => features.aspiration = false,
-                "reverse_futility" => features.reverse_futility = false,
-                "futility" => features.futility = false,
-                "late_move_pruning" => features.late_move_pruning = false,
-                "internal_iterative_deepening" => features.internal_iterative_deepening = false,
-                "log_reductions" => features.log_reductions = false,
-                "counter_moves" => features.counter_moves = false,
-                "lmr_refinements" => features.lmr_refinements = false,
-                "soft_time_limit" => features.soft_time_limit = false,
-                "mobility" => features.eval.mobility = false,
-                "threats" => features.eval.threats = false,
-                "king_safety" => features.eval.king_safety = false,
-                "passed_pawn_king_proximity" => features.eval.passed_pawn_king_proximity = false,
-                other => panic!("--without does not know {}", other),
-            }
+            set_flag(&mut features, name, false);
+        }
+        for name in &self.with {
+            set_flag(&mut features, name, true);
         }
         features
     }
 }
+
+/// Turns one technique on or off by the name the command line uses.
+///
+/// `--without` is how a technique that ships *on* is measured, and `--with` is how one
+/// that ships *off* is: the flag and its measurement stay in the tree either way, so a
+/// later round can re-test a term that lost once without writing it again.
+fn set_flag(features: &mut SearchFeatures, name: &str, value: bool) {
+    match name {
+        "see_pruning" => features.see_pruning = value,
+        "see_ordering" => features.see_ordering = value,
+        "aspiration" => features.aspiration = value,
+        "reverse_futility" => features.reverse_futility = value,
+        "futility" => features.futility = value,
+        "late_move_pruning" => features.late_move_pruning = value,
+        "internal_iterative_deepening" => features.internal_iterative_deepening = value,
+        "log_reductions" => features.log_reductions = value,
+        "counter_moves" => features.counter_moves = value,
+        "lmr_refinements" => features.lmr_refinements = value,
+        "probcut" => features.probcut = value,
+        "soft_time_limit" => features.soft_time_limit = value,
+        "mobility" => features.eval.mobility = value,
+        "threats" => features.eval.threats = value,
+        "connected_pawns" => features.eval.connected_pawns = value,
+        "king_storm" => features.eval.king_storm = value,
+        "drawish_endings" => features.eval.drawish_endings = value,
+        "king_safety" => features.eval.king_safety = value,
+        "passed_pawn_king_proximity" => features.eval.passed_pawn_king_proximity = value,
+        other => panic!("{} is not a flag name", other),
+    }
+}
+
 
 impl Options {
     fn from_arguments() -> Options {
@@ -168,10 +201,12 @@ impl Options {
             games: 100,
             time_ms: 60,
             depth: 8,
+            old_depth: 0,
             threads: 0,
             verbose: false,
             opponent: Opponent::Shipped,
             without: Vec::new(),
+            with: Vec::new(),
         };
         let arguments: Vec<String> = std::env::args().skip(1).collect();
         let mut index = 0;
@@ -195,6 +230,10 @@ impl Options {
                     options.depth = number(index) as i32;
                     index += 1;
                 }
+                "--old-depth" => {
+                    options.old_depth = number(index) as i32;
+                    index += 1;
+                }
                 "--threads" => {
                     options.threads = number(index) as usize;
                     index += 1;
@@ -206,6 +245,14 @@ impl Options {
                         .unwrap_or_else(|| panic!("--without needs a flag name"))
                         .clone();
                     options.without.push(name);
+                    index += 1;
+                }
+                "--with" => {
+                    let name = arguments
+                        .get(index + 1)
+                        .unwrap_or_else(|| panic!("--with needs a flag name"))
+                        .clone();
+                    options.with.push(name);
                     index += 1;
                 }
                 "--old" => {
@@ -324,8 +371,23 @@ fn play(
     while outcome == Outcome::Playing && plies < MAX_PLIES {
         let now_to_move = (board.side_to_move() == WHITE) == now_is_white;
         let searcher = if now_to_move { &mut *now } else { &mut *old };
+        // The depth cap can differ between the two sides, which is how the change that
+        // let the clock choose the depth is measured on its own: cap one side at what
+        // the level used to reach and let the other run to the clock, at the same time
+        // per move.  Zero means "no cap beyond the level's own".
+        let depth = if now_to_move {
+            options.depth
+        } else {
+            options.old_depth
+        };
+        // Zero asks for the level's own cap, which is what the shipped side uses.
+        let depth = if depth == 0 {
+            Level::Strong.config().0
+        } else {
+            depth
+        };
         let limits = SearchLimits {
-            max_depth: options.depth,
+            max_depth: depth,
             time_ms: if options.time_ms == 0 {
                 NO_TIME_LIMIT
             } else {

@@ -8,8 +8,9 @@ pruning and fail-soft bounds, aspiration windows, a 32 MB transposition table,
 MVV-LVA ordering backed by killer and history heuristics, static exchange
 evaluation, reverse futility and a quiescence search at the leaves.  The evaluation
 is PeSTO's tables plus mobility over the squares enemy pawns do not cover, king
-safety and pawn structure.  It targets club strength and reaches ten ply well inside
-a second in a browser tab.
+safety and pawn structure.  It targets club strength, and the clock — not a depth cap
+— is what decides how deep it looks: eleven ply inside a seven-tenths-of-a-second
+move in a browser tab, nineteen in a simple endgame.
 
 * Live on the arcade: **<https://arcade.pattygcoding.com/chess>**
 * The JavaScript interface is one `Engine` class; the page never sees a bitboard.
@@ -28,12 +29,16 @@ without a browser.
 | perft(4) from Kiwipete, 4,085,603 nodes | 0.12 s | — |
 | Move generation rate | ~33 Mnodes/s | ~23 Mnodes/s |
 | Search rate | ~1.5–2.4 Mnodes/s | ~1.3–1.6 Mnodes/s |
-| Club level (0.7 s, 10 ply cap): depth reached | 10, in ~0.2 s | 10, in ~0.3 s |
-| Strong level (1.5 s, 14 ply cap): Kiwipete | 12, in 0.9 s | 12, in 1.3 s |
+| Club level (0.7 s budget, 12 ply cap): depth reached | 11, in ~0.7 s | 11, in ~0.5 s |
+| Strong level (1.5 s budget, 16 ply cap): Kiwipete | 12, in ~0.9 s | 12, in ~1.2 s |
 | Compiled module | — | 109 KB `.wasm` + 20 KB glue |
 
-Both levels finish inside their budget and are then held back by their depth caps, so
-the caps — not the clock — are what makes a level's turn take the time it takes.
+The caps are a backstop against a runaway node count, not a target.  They used to be
+5, 10 and 14 ply, which the engine reached using **a third of its clock** and then
+stopped — so the cap, not the clock, was deciding how deep it looked, and it was
+throwing away two ply a move to save time it had already been given.  Raising the
+caps, and fixing the guess that decides whether another iteration fits, was the
+cheapest strength this project ever gained: **+187 Elo**, measured below.
 
 ## How strong it is, and how that was checked
 
@@ -43,11 +48,25 @@ Two hundred games at equal time against the engine as it was first released:
 
 | Comparison | Result |
 | --- | --- |
+| Round four: letting the clock, not a depth cap, choose the depth (equal time 200 ms, 120 games) | **+187 Elo** (+142 to +232) |
 | Everything on vs the released engine (equal time, 300 games) | **+227 Elo** (+192 to +261) |
+| Round four's build vs the released engine (equal time, 200 games) | **+233 Elo** (+192 to +274) |
+| Round four's techniques vs round three's configuration (equal time, 200 games) | −19 Elo (−41 to +3) |
 | The second round vs the first (equal time, 300 games) | **+42 Elo** (+20 to +64) |
 | Everything on vs the same search without the new techniques (equal depth 6, 300 games) | +64 Elo (+43 to +86) |
 | Everything on vs the same engine with the score read from white (equal time, 60 games) | won every game |
 | Identical engines against each other (the control) | 50% of the points |
+
+The +187 is the one row that is not a straight self-play comparison: both sides are
+the same build, and the *opponent* is capped at nine ply — the depth the old caps
+reached in the time available — while the shipped side runs to the clock.  It is
+therefore what the cap used to cost, not what round four's code is worth.
+
+The round-four row next to it is why that distinction matters.  Measured at 60 ms a
+move, where neither the old caps nor the new ones bind, round four's extra techniques
+are **−19 Elo** (−41 to +3) against round three — the same verdict the per-term rows
+below reach one at a time.  The strength in this round is the time management and the
+numbers that come with it, and the honest thing to do with the rest is leave it off.
 
 The last row is the one that says the harness works: with both sides configured the
 same it reports +0 Elo over 120 games, so the numbers above are about the flags and
@@ -87,19 +106,36 @@ The error bars are around ±20 Elo, so this is what the set is worth:
 | Exchange-value capture ordering | -44 | +17 | no |
 | Internal iterative deepening | 0 | -41 | no |
 | Late move pruning | -144, -89 | -7 | no |
+| ProbCut | | +31, +2, −19 | no: it saves nodes, not points |
+| King storm (enemy pawns advancing on the king) | +44 | −46 with its companion | no |
+| Drawish endings (score scaled towards a draw) | 0 | " | no |
+| Connected pawns (pawns defended by pawns) | 0 | | no |
 
 The negative results are the point of the exercise.  Late move pruning, internal
 iterative deepening and the counter-move heuristic are all standard, all measured
-*worse*, and all off by default with the flag and the measurement left in place.
+*worse*, and all off by default with the flag and the measurement left in place.  Every
+one of them can be re-tested from the command line — `match --old full --without
+<flag>`, or `--with <flag>` for one that ships off — without writing it again.
 
-Two things that table taught me, both worth more than the Elo.  **A term can flip
+Three things that table taught me, all worth more than its Elo.  **A term can flip
 sign when it is done properly**: mobility measured -44 counting every square a piece
 attacks and +22 counting only the squares enemy pawns do not cover, which is the same
-weights over a different area.  And **the rows are not additive, and a small effect
-cannot be separated from noise by a small match**: safe mobility and the check
-exception each measure around ±20 Elo, which 240 games can flip, so the number quoted
-for them is the pair (+42 at equal time against the previous release) rather than the
-sum of two wobbly parts.
+weights over a different area.  **Per ply is not per second**: king storm measured +44
+at equal depth and −46 at equal time, because a term that adds to the score also makes
+the score a worse predictor of the search's own answer, and every pruning decision
+leans on that prediction.  And **the rows are not additive, and a small effect cannot
+be separated from noise by a small match**: safe mobility and the check exception each
+measure around ±20 Elo, which 240 games can flip, so the number quoted for them is the
+pair (+42 at equal time against the previous release) rather than the sum of two wobbly
+parts.
+
+The largest number in this round came from none of those terms.  It came from reading
+the clock: the levels had depth caps (5, 10 and 14 ply) that the engine reached in
+**a third of its budget**, so it stopped while it still had two thirds of a move's time
+in hand, two ply short of what it had been given.  Fixing that — higher caps, and an
+honest guess about whether the next iteration fits — was worth +187 Elo over the caps
+at the time the levels actually used, on 120 games at 200 ms a move, and it is the only
+change in this project that needed no new search idea at all.
 
 ## How it works
 
@@ -112,14 +148,25 @@ sum of two wobbly parts.
 | `src/evaluate.rs` | PeSTO's piece-square tables, tapered, with pawn-structure, king-safety and passed-pawn terms |
 | `src/see.rs` | Static exchange evaluation, with a brute-force reference in its tests |
 | `src/tt.rs` | Compile-time Zobrist keys and the transposition table |
-| `src/search.rs` | Iterative deepening, alpha-beta, aspiration, null-move, SEE, LMR, quiescence |
+| `src/search.rs` | Iterative deepening, alpha-beta, aspiration, null-move, SEE, LMR, quiescence, time management |
 | `src/perft.rs` | The move generator's test rig, and the published counts |
 | `src/lib.rs` | The `wasm-bindgen` interface the page talks to |
-| `src/bin/match.rs` | Self-play matches between feature sets, with Elo and its interval |
+| `src/bin/match.rs` | Self-play matches between feature sets, with Elo and its interval; `--without`/`--with` measures one flag, `--old-depth` prices a depth change |
 | `src/bin/bench.rs` | The speed report above |
 | `web/` | The harness: `index.html`, `main.js`, `worker.js`, `pkg/` |
 
-Three decisions are worth calling out:
+Four decisions are worth calling out:
+
+**The clock chooses the depth, and an abandoned iteration costs nothing.**  Iterative
+deepening asks a question before each iteration: will the next one fit?  The guess is
+the last iteration's duration times 1.4, and the iteration only starts if that fits
+inside 95% of the budget.  The guess is allowed to be wrong, because a wrong guess is
+free — the deadline stops the search part-way through, the answer stays whatever the
+last *finished* iteration found, and the caller has already agreed to spend the time.
+Being pessimistic instead is what cost this engine 187 Elo: it used to assume the next
+iteration would cost twice the last, refuse to start it, and hand back a two-ply
+shallower move with a third of its clock unspent.  The level's depth cap is a backstop
+against a runaway node count, not a target.
 
 **Sliding attacks are ray walks, not magic bitboards.**  A ray walk is a few times
 slower than a magic lookup table, but it fits on a page and its correctness story is
@@ -222,9 +269,9 @@ always play the single best move.
 
 | Level | Depth cap | Budget | "Nearly as good" margin |
 | --- | --- | --- | --- |
-| Casual (0) | 5 | 250 ms | 70 cp |
-| Club (1) | 10 | 700 ms | 20 cp |
-| Strong (2) | 14 | 1500 ms | 0 cp |
+| Casual (0) | 12 | 250 ms | 70 cp |
+| Club (1) | 16 | 700 ms | 20 cp |
+| Strong (2) | 20 | 1500 ms | 0 cp |
 
 A weakened level's margin is a promise the search has to keep, which means the moves
 inside the band need their *real* scores.  Probing a root move at alpha returns a

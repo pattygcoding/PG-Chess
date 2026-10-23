@@ -79,11 +79,26 @@ const LATE_MOVE_PRUNING: [usize; 4] = [0, 8, 20, 40];
 /// first move actually costs something.
 const IID_MINIMUM_DEPTH: i32 = 5;
 
+/// ProbCut: how far above beta a shallow search of a capture has to come back before the
+/// node is cut, and how many plies shallower that search is.  The margin is what keeps
+/// it honest — the shallow search is a weaker player, so it is only believed when it
+/// wins by more than its own error.
+const PROBCUT_MARGIN: i32 = 200;
+const PROBCUT_DEPTH: i32 = 4;
+
 /// An iteration is only started while the budget can absorb this share of it, and the
 /// next iteration is assumed to cost this multiple of the last one.  See the loop in
 /// `search` for why a guess beats a fixed share of the clock.
-const ITERATION_BUDGET_SHARE: f64 = 0.9;
-const ITERATION_GROWTH: f64 = 2.0;
+///
+/// The multiple is an *estimate*, not a worst case: an iteration that runs out of time
+/// changes nothing about the answer, because the search returns the last depth that
+/// finished, so the whole cost of starting one that does not finish is the wall-clock
+/// time the caller was willing to spend anyway.  Being pessimistic here throws depth
+/// away for nothing.  The bench shows an iteration costing between 1.3 and 2.4 times
+/// the one before it depending on the position, so 2.0 was leaving a third of the
+/// budget unused; 1.4 with a 5% margin spends it.
+const ITERATION_BUDGET_SHARE: f64 = 0.95;
+const ITERATION_GROWTH: f64 = 1.4;
 
 /// Which of the search's strength techniques are switched on.
 ///
@@ -94,9 +109,10 @@ const ITERATION_GROWTH: f64 = 2.0;
 /// whether they made it stronger rather than merely cleverer.
 ///
 /// `all()` is the configuration that ships, and it is *not* "every flag true": each
-/// flag below was measured on its own with `match --old full --without <flag>`, 120
-/// games at equal depth and 160 at equal time, and the ones that measured neutral or
-/// worse are off by default even though the code stays behind the flag.
+/// flag below was measured on its own with `match --old full --without <flag>` (or
+/// `--with <flag>` for one that ships off), 120 games at equal depth and 160 at equal
+/// time, and the ones that measured neutral or worse are off by default even though
+/// the code stays behind the flag.
 ///
 /// | flag | equal depth | equal time |
 /// | --- | --- | --- |
@@ -110,15 +126,28 @@ const ITERATION_GROWTH: f64 = 2.0;
 /// | `log_reductions` | +23 | +9 |
 /// | `futility` | 0 | -15 |
 /// | `soft_time_limit` | n/a | 0 |
+/// | `probcut` | | +31, +2, -19 |
 /// | `threats` | 0 | +3 |
 /// | `counter_moves` | -2 | -37 |
 /// | `see_ordering` | -44 | +17 |
 /// | `internal_iterative_deepening` | 0 | -41 |
 /// | `late_move_pruning` | -144, -89 milder | -7 |
+/// | `king_storm` | +44 | -46 with `drawish_endings` |
+/// | `drawish_endings` | 0 | " |
+/// | `connected_pawns` | 0 | |
 ///
 /// The error bars are around ±20, so the top five are wins, `futility` and the soft
 /// time limit are free (they cost nothing measurable and save nodes or waiting), and
-/// the last six earn nothing: they are the interesting negative results.
+/// the last nine earn nothing: they are the interesting negative results.
+///
+/// The three positional terms in round four are the odd ones out, and they are what
+/// taught this project the most.  `king_storm` measured **+44 Elo at equal depth** and
+/// the pair of it and `drawish_endings` measured **−46 at equal time**, and that is not
+/// a contradiction: a term that adds to the score also makes the score a worse
+/// predictor of the search's own answer, and every pruning decision here — reverse
+/// futility, futility, ProbCut, delta pruning in quiescence — leans on that prediction.
+/// Strength per ply and strength per second are different questions, and a term has to
+/// answer the second one to ship.
 ///
 /// Rows measured in different configurations are not additive, and the last four were
 /// measured against a configuration that differed from the one that ships.  Re-measured
@@ -154,6 +183,9 @@ pub struct SearchFeatures {
     pub counter_moves: bool,
     /// Reductions are adjusted: a move that gives check is not reduced at all.
     pub lmr_refinements: bool,
+    /// A capture that wins enough material lets the node be cut with a shallow search
+    /// of that capture alone, instead of a full search of every move.
+    pub probcut: bool,
     /// Iterations that cannot finish are not started.
     pub soft_time_limit: bool,
     /// Which evaluation terms the search asks for.
@@ -177,6 +209,11 @@ impl SearchFeatures {
             // counter already cover the case it is for.
             counter_moves: false,
             lmr_refinements: true,
+            // Off: the node count it saves is real, but the score is not, and two
+            // equal-time measurements over 200 games each put it at +2 and −19 — one on
+            // each side of zero.  Off like the rest of the neutral set, and `match --old
+            // full --with probcut` re-tests it without rewriting it.
+            probcut: false,
             soft_time_limit: true,
             eval: evaluate::EvalFeatures::all(),
         }
@@ -196,6 +233,7 @@ impl SearchFeatures {
             log_reductions: false,
             counter_moves: false,
             lmr_refinements: false,
+            probcut: false,
             soft_time_limit: false,
             eval: evaluate::EvalFeatures::none(),
         }
@@ -235,9 +273,15 @@ impl Level {
     /// Depth cap, time budget in milliseconds and the "nearly as good" margin.
     pub fn config(self) -> (i32, u64, i32) {
         match self {
-            Level::Casual => (5, 250, 70),
-            Level::Club => (10, 700, 20),
-            Level::Strong => (14, 1500, 0),
+            // The depth cap is a backstop against a runaway node count, not a target:
+            // the clock is what stops the search.  These caps used to be 5, 10 and 14,
+            // which the engine now reaches in a fraction of its budget (depth ten in
+            // 211 ms of a 700 ms move), so the cap, not the clock, was choosing how
+            // deep it looked.  The bench shows the depth each level now reaches and the
+            // milliseconds it took to get there.
+            Level::Casual => (12, 250, 70),
+            Level::Club => (16, 700, 20),
+            Level::Strong => (20, 1500, 0),
         }
     }
 }
@@ -362,6 +406,14 @@ pub struct Searcher {
     /// weakening pass at the end has something to choose between.
     root_moves: MoveList,
     root_scores: [i32; MAX_MOVES],
+    /// `root_scores` as of the last iteration that *finished*, together with the move
+    /// order it was written against.  An iteration that runs out of time is abandoned
+    /// mid-way, so its scores are a mixture of the values it published and the ones it
+    /// never reached, and the next iteration re-sorts the list under them; the weakening
+    /// pass has to choose between moves on the last *complete* set, in the order that
+    /// set was ranked in.
+    completed_moves: MoveList,
+    completed_root_scores: [i32; MAX_MOVES],
     /// The current level's "nearly as good" margin in centipawns.
     level_margin: i32,
     /// Which strength techniques are switched on.  Everything the search does
@@ -387,6 +439,8 @@ impl Searcher {
             pv_length: [0; MAX_PLY],
             root_moves: MoveList::new(),
             root_scores: [0; MAX_MOVES],
+            completed_moves: MoveList::new(),
+            completed_root_scores: [0; MAX_MOVES],
             level_margin: 0,
             features: SearchFeatures::all(),
             reductions: build_reductions(),
@@ -423,6 +477,8 @@ impl Searcher {
         self.killers = [[0; 2]; MAX_PLY];
         self.history = [[[0; 64]; 64]; 2];
         self.counter_moves = [[0; 64]; 64];
+        self.completed_moves = MoveList::new();
+        self.completed_root_scores = [0; MAX_MOVES];
         self.tt.clear();
     }
 
@@ -461,6 +517,11 @@ impl Searcher {
         self.root_scores = [0; MAX_MOVES];
         let mut result = SearchResult::empty();
         let mut last_iteration_ms = 0.0;
+        // Nothing has finished yet in *this* search.  The snapshot has to start empty:
+        // an abandoned iteration would otherwise leave the weakening pass choosing
+        // between moves from the previous position, which are not even legal here.
+        self.completed_moves = MoveList::new();
+        self.completed_root_scores = [0; MAX_MOVES];
 
         for depth in 1..=limits.max_depth {
             // Whether to start another iteration at all is a bet on it finishing: a
@@ -487,6 +548,11 @@ impl Searcher {
             result.score = score;
             result.best = self.pv_table[0][0];
             result.pv = self.pv_table[0][..self.pv_length[0]].to_vec();
+            // The iteration finished, so its scores are the ones the level is allowed to
+            // choose between: snapshot them with the order they were ranked in before
+            // the next iteration re-sorts the list under them.
+            self.completed_moves = self.root_moves.clone();
+            self.completed_root_scores = self.root_scores;
             // A forced mate is settled; nothing deeper changes it.
             if score.abs() > MATE_THRESHOLD {
                 break;
@@ -887,6 +953,53 @@ impl Searcher {
             }
         }
 
+        // ProbCut: some captures settle a node on their own.  A capture that wins
+        // material even after the recaptures — the exchange evaluator says so — is
+        // searched at a reduced depth with the window raised by a margin, and if it
+        // still comes back above that, the node is cut and the result stored as a lower
+        // bound so later visits to this position skip the work.  The margin is what
+        // makes it sound: a shallow search is a weaker player, so it is only believed
+        // when it wins by more than its own error.
+        if self.features.probcut
+            && !is_pv
+            && !in_check
+            && depth >= PROBCUT_DEPTH + 1
+            && beta.abs() < MATE_THRESHOLD
+        {
+            let prob_beta = beta + PROBCUT_MARGIN;
+            let shallow = depth - PROBCUT_DEPTH;
+            let mut captures = MoveList::new();
+            movegen::generate_captures(board, &mut captures);
+            for index in 0..captures.len() {
+                let mv = captures.get(index);
+                // Only a capture that wins material outright is worth the shallow
+                // search; one that loses it cannot cut, whatever the shallow search
+                // says.
+                if !see::see_ge(board, mv, prob_beta - static_eval) {
+                    continue;
+                }
+                if !board.make_move(mv) {
+                    continue;
+                }
+                let score =
+                    -self.negamax(board, shallow, -prob_beta, -prob_beta + 1, ply + 1, false);
+                board.unmake_move();
+                if self.stopped {
+                    return 0;
+                }
+                if score >= prob_beta {
+                    self.tt.store(
+                        key,
+                        mv,
+                        score_to_tt(score, ply),
+                        shallow,
+                        FLAG_LOWER,
+                    );
+                    return score;
+                }
+            }
+        }
+
         let mut moves = MoveList::new();
         movegen::generate_pseudo_legal(board, &mut moves);
         let mut scores = [0i32; MAX_MOVES];
@@ -1226,7 +1339,7 @@ impl Searcher {
     /// always plays out the same way.  The other levels always take the best move.
     fn apply_level_weakening(&mut self, board: &Board, result: &mut SearchResult) {
         let margin = self.level_margin;
-        if margin <= 0 || self.root_moves.len() < 2 || result.depth < 2 {
+        if margin <= 0 || self.completed_moves.len() < 2 || result.depth < 2 {
             return;
         }
         if result.score.abs() > MATE_THRESHOLD {
@@ -1241,9 +1354,9 @@ impl Searcher {
         // `every_move_the_weakening_offers_is_really_within_its_margin` is the test that
         // says so.
         let mut candidates = 0;
-        for index in 0..self.root_moves.len() {
-            let mv = self.root_moves.get(index);
-            let score = self.root_scores[index];
+        for index in 0..self.completed_moves.len() {
+            let mv = self.completed_moves.get(index);
+            let score = self.completed_root_scores[index];
             if mv != 0 && score != 0 && score > result.score - margin {
                 candidates += 1;
             }
@@ -1276,9 +1389,9 @@ impl Searcher {
         }
 
         let mut seen = 0;
-        for index in 0..self.root_moves.len() {
-            let mv = self.root_moves.get(index);
-            let score = self.root_scores[index];
+        for index in 0..self.completed_moves.len() {
+            let mv = self.completed_moves.get(index);
+            let score = self.completed_root_scores[index];
             if mv == 0 || score == 0 || score <= result.score - margin {
                 continue;
             }
@@ -1460,7 +1573,7 @@ mod tests {
 
     #[test]
     fn the_levels_differ_in_how_deep_and_how_long_they_search() {
-        for (level, expected_cap) in [(0u32, 5), (1, 10), (2, 14)] {
+        for (level, expected_cap) in [(0u32, 12), (1, 16), (2, 20)] {
             let (cap, _, _) = Level::from_number(level).config();
             assert_eq!(cap, expected_cap);
         }
@@ -1476,7 +1589,7 @@ mod tests {
         }
         // A depth of zero means "whatever this level is for".
         let limits = SearchLimits::new(0, 0, 1);
-        assert_eq!(limits.max_depth, 10);
+        assert_eq!(limits.max_depth, 16);
         assert_eq!(limits.time_ms, 700);
         // An explicit request wins.
         let limits = SearchLimits::new(3, 120, 0);
@@ -1751,6 +1864,36 @@ mod tests {
             "overran the budget: {} ms",
             result.time_ms
         );
+    }
+
+    #[test]
+    fn a_weakened_level_plays_a_legal_move_even_when_its_search_is_cut_off() {
+        // The weakening pass chooses among the moves of the last iteration that
+        // *finished*, and the budget here is small enough that most iterations are
+        // abandoned part-way.  A snapshot taken from the previous search — or from an
+        // unfinished one — would let the level play a move that is not legal in the
+        // position it is looking at, so this plays a few moves of a game with a level
+        // that weakens its choice and a budget of one millisecond per move.
+        for (level, _) in [(0u32, Level::Casual), (1, Level::Club)] {
+            let mut board = Board::startpos();
+            let mut searcher = Searcher::new(4);
+            for ply in 0..6 {
+                let legal = board.legal_moves();
+                if legal.is_empty() {
+                    break;
+                }
+                let result = searcher.search(&mut board, SearchLimits::new(0, 1, level));
+                assert_ne!(result.best, 0, "no move at ply {}", ply);
+                assert!(
+                    legal.contains(result.best),
+                    "ply {}: {} is not legal in {}",
+                    ply,
+                    moves::to_uci(result.best),
+                    board.to_fen()
+                );
+                assert!(board.make_move(result.best));
+            }
+        }
     }
 
     #[test]
